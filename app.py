@@ -37,8 +37,22 @@ def health():
 async def webhook(
     request: Request,
     x_webhook_secret: Optional[str] = Header(default=None, convert_underscores=False),
+    authorization: Optional[str] = Header(default=None),
 ):
-    if WEBHOOK_SECRET and x_webhook_secret != WEBHOOK_SECRET:
+    # Accept secret from multiple possible headers
+    provided = x_webhook_secret or authorization or ""
+
+    # Handle: Authorization: Bearer <secret>
+    if provided.lower().startswith("bearer "):
+        provided = provided[7:].strip()
+
+    # Handle badly formatted "x-webhook-secret: value"
+    if provided.lower().startswith("x-webhook-secret"):
+        parts = provided.split(":", 1)
+        if len(parts) == 2:
+            provided = parts[1].strip()
+
+    if WEBHOOK_SECRET and provided != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Invalid webhook secret")
 
     payload = await request.json()
