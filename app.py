@@ -28,6 +28,29 @@ def append_jsonl(record: Dict[str, Any]) -> None:
     with EVENT_LOG.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record))
         f.write("\n")
+        
+# =======================
+# PAPER TRADING STATE
+# =======================
+
+PAPER_STATE_FILE = Path("logs/paper_state.json")
+
+def load_paper_state():
+    if not PAPER_STATE_FILE.exists():
+        return {
+            "cash": 500.0,
+            "positions": {},
+            "trades": []
+        }
+    return json.loads(PAPER_STATE_FILE.read_text())
+
+def save_paper_state(state):
+    PAPER_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    PAPER_STATE_FILE.write_text(json.dumps(state, indent=2))
+
+@app.get("/paper/state")
+def paper_state():
+    return load_paper_state()
 
 @app.get("/health")
 def health():
