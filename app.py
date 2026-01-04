@@ -33,6 +33,15 @@ def append_jsonl(record: Dict[str, Any]) -> None:
 def health():
     return {"ok": True, "service": APP_NAME, "time": utc_now_iso()}
 
+@app.get("/events")
+def get_events():
+    ensure_logfile()
+    lines = EVENT_LOG.read_text(encoding="utf-8").splitlines()[-200:]
+    return {
+        "count": len(lines),
+        "events": [json.loads(l) for l in lines]
+    }
+
 @app.post("/webhook")
 async def webhook(
     request: Request,
