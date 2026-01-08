@@ -186,7 +186,14 @@ async def webhook(
         "source": "helius",
         "payload": payload,
     }
-    append_jsonl(record)
-apply_paper_trade_from_helius(payload)
+   append_jsonl(record)
 
-    return JSONResponse({"ok": True})
+# ---- PAPER TRADING ----
+if isinstance(payload, list):
+    for evt in payload:
+        apply_paper_trade_from_helius(evt)
+elif isinstance(payload, dict):
+    apply_paper_trade_from_helius(payload)
+
+return JSONResponse({"ok": True})
+
