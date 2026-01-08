@@ -34,11 +34,19 @@ def append_jsonl(record: Dict[str, Any]) -> None:
 # =======================
 
 PAPER_STATE_FILE = Path("logs/paper_state.json")
+# ---- Paper trading realism knobs (USD) ----
+START_CASH_USD = 500.0
+
+MIN_TRADE_USD = 75.0          # avoid fee death
+MAX_TRADE_PCT = 0.15          # max 15% per trade
+
+FEE_FIXED_USD = 1.00          # priority / compute / bribe baseline
+FEE_PCT = 0.020               # 2% total slippage + impact
 
 def load_paper_state():
     if not PAPER_STATE_FILE.exists():
         return {
-            "cash": 500.0,
+            "cash": START_CASH_USD,
             "positions": {},
             "trades": []
         }
@@ -47,6 +55,90 @@ def load_paper_state():
 def save_paper_state(state):
     PAPER_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     PAPER_STATE_FILE.write_text(json.dumps(state, indent=2))
+
+# ===============================
+# PAPER TRADE LOGIC
+# ===============================
+
+SOL_PRICE_USD = float(os.getenv("SOL_PRICE_USD", "100"))
+FEE_FIXED_USD = float(os.getenv("FEE_FIXED_USD", "1.00"))
+FEE_PCT = float(os.getenv("FEE_PCT", "0.020"))
+
+
+def _find_user_account(payload0: dict) -> dict:
+    account_data = payload0.get("accountData") or []
+    if not isinstance(account_data, list):
+        return {}
+
+    for a in account_data:
+        if (a.get("tokenBalanceChanges") or []) != []:
+            return a
+
+    for a in account_data:
+        if a.get("nativeBalanceChange", 0) != 0:
+            return a
+
+    return account_data[0] if account_data else {}
+
+
+def _sum_token_delta_for_user(account_entry: dict):
+    tbc = account_entry.get("tokenBalanceChanges") or []
+    if not tbc:
+        return (None, 0.0)
+
+    deltas = {}
+    for ch in tbc:
+        mint = ch.get("mint")
+        raw = (ch.get("rawTokenAmount") or {}).get("tokenAmount")
+        dec = (ch.get("rawTokenAmount") or {}).get("decimals", 0)
+
+        if mint is None or raw is None:
+            continue
+
+        qty = float(raw) / (10 ** int(dec))
+        deltas[mint] = deltas.get(mint, 0.0) + qty
+
+    mint = max(deltas, key=lambda m: abs(deltas[m]))
+    return mint, deltas[mint]
+
+
+def apply_paper_trade_from_helius(payload0: dict):
+    evt_type = (payload0.get("type") or "").upper()
+    if "SWAP" not in evt_type:
+        return
+
+    account_entry = _find_user_account(payload0)
+    if not account_entry:
+        return
+
+    sol_delta = float(account_entry.get("nativeBalanceChange", 0)) / 1e9
+    mint, token_delta = _sum_token_delta_for_user(account_entry)
+
+    if mint is None or token_delta == 0:
+        return
+
+    side = "BUY" if token_delta > 0 and sol_delta < 0 else "SELL"
+    trade_usd = abs(sol_delta) * SOL_PRICE_USD
+    fees_usd = FEE_FIXED_USD + trade_usd * FEE_PCT
+
+    state = load_paper_state()
+
+    state["cash"] += (sol_delta * SOL_PRICE_USD) - fees_usd
+    state["positions"][mint] = state["positions"].get(mint, 0) + token_delta
+
+    state["trades"].append({
+        "ts": utc_now_iso(),
+        "side": side,
+        "mint": mint,
+        "token_delta": token_delta,
+        "sol_delta": sol_delta,
+        "trade_usd_est": trade_usd,
+        "fees_usd_est": fees_usd,
+        "sig": payload0.get("signature"),
+    })
+
+    state["trades"] = state["trades"][-200:]
+    save_paper_state(state)
 
 @app.get("/paper/state")
 def paper_state():
@@ -95,5 +187,6 @@ async def webhook(
         "payload": payload,
     }
     append_jsonl(record)
+apply_paper_trade_from_helius(payload)
 
     return JSONResponse({"ok": True})
