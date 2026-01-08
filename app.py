@@ -104,8 +104,11 @@ def _sum_token_delta_for_user(account_entry: dict):
 
 def apply_paper_trade_from_helius(payload0: dict):
     evt_type = (payload0.get("type") or "").upper()
-    if "SWAP" not in evt_type:
-        return
+
+# TEMP DEBUG: don't require "SWAP" yet (Helius often labels swaps differently)
+if evt_type == "":
+    return
+
 
     account_entry = _find_user_account(payload0)
     if not account_entry:
