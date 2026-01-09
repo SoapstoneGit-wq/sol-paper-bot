@@ -182,14 +182,14 @@ async def webhook(
     if WEBHOOK_SECRET and provided != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Invalid webhook secret")
 
-    payload = await request.json()
+     payload = await request.json()
 
     record = {
         "received_at": utc_now_iso(),
         "source": "helius",
         "payload": payload,
     }
-   append_jsonl(record)
+    append_jsonl(record)
 
     # ==== PAPER TRADING ====
     if isinstance(payload, list):
@@ -198,6 +198,4 @@ async def webhook(
     elif isinstance(payload, dict):
         apply_paper_trade_from_helius(payload)
 
-
-return JSONResponse({"ok": True})
-
+    return JSONResponse({"ok": True})
