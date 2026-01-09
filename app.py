@@ -182,7 +182,7 @@ async def webhook(
     if WEBHOOK_SECRET and provided != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Invalid webhook secret")
 
-     payload = await request.json()
+    payload = await request.json()
 
     record = {
         "received_at": utc_now_iso(),
