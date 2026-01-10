@@ -2,96 +2,116 @@ import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-# =========================================================
-# CONFIG
-# =========================================================
+# ==========================================================
+# BASIC APP CONFIG
+# ==========================================================
 
 APP_NAME = "sol-paper-bot"
+TRACKED_WALLET = (os.getenv("TRACKED_WALLET") or "").strip()
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 
-START_CASH_USD = 500.0
-FIXED_TRADE_USD = 100.0
-FIXED_FEE_USD = 3.00
+SOL_PRICE_USD = float(os.getenv("SOL_PRICE_USD", "100"))
+FEE_FIXED_USD = float(os.getenv("FEE_FIXED_USD", "1"))
+FEE_PCT = float(os.getenv("FEE_PCT", "0.02"))
 
 LOG_DIR = Path("logs")
 EVENT_LOG = LOG_DIR / "events.jsonl"
-STATE_FILE = LOG_DIR / "paper_state.json"
-
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+PAPER_STATE_FILE = LOG_DIR / "paper_state.json"
 
 app = FastAPI(title=APP_NAME)
 
-# =========================================================
-# UTIL
-# =========================================================
+# ==========================================================
+# HELPERS
+# ==========================================================
 
-def utc_now():
+def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-def ensure_logs():
+def ensure_logfile():
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     if not EVENT_LOG.exists():
-        EVENT_LOG.write_text("")
+        EVENT_LOG.write_text("", encoding="utf-8")
 
-def append_event(obj):
-    ensure_logs()
-    with EVENT_LOG.open("a") as f:
-        f.write(json.dumps(obj) + "\n")
+def append_jsonl(record: Dict[str, Any]):
+    ensure_logfile()
+    with EVENT_LOG.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
 
-# =========================================================
+# ==========================================================
 # PAPER STATE
-# =========================================================
+# ==========================================================
 
-def load_state():
-    if not STATE_FILE.exists():
-        return {
-            "cash": START_CASH_USD,
-            "positions": {},
-            "trades": []
-        }
-    return json.loads(STATE_FILE.read_text())
+def load_paper_state():
+    if not PAPER_STATE_FILE.exists():
+        return {"cash": 500.0, "positions": {}, "trades": []}
+    return json.loads(PAPER_STATE_FILE.read_text())
 
-def save_state(state):
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(state, indent=2))
+def save_paper_state(state):
+    PAPER_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    PAPER_STATE_FILE.write_text(json.dumps(state, indent=2))
 
-# =========================================================
-# HELIUS PARSING
-# =========================================================
+# ==========================================================
+# Helius Parsing Logic
+# ==========================================================
 
-def find_user_account(payload):
-    accounts = payload.get("accountData", [])
-    if not isinstance(accounts, list):
-        return None
+def _find_user_account(payload: dict) -> dict:
+    accounts = payload.get("accountData") or []
+    if not accounts:
+        return {}
 
-    for acc in accounts:
-        if acc.get("tokenBalanceChanges"):
-            return acc
+    if TRACKED_WALLET:
+        for a in accounts:
+            if a.get("account") == TRACKED_WALLET:
+                return a
 
-    for acc in accounts:
-        if acc.get("nativeBalanceChange", 0) != 0:
-            return acc
+    for a in accounts:
+        if a.get("nativeBalanceChange", 0) != 0:
+            return a
 
-    return None
+    return accounts[0]
 
-def extract_token_delta(account):
-    changes = account.get("tokenBalanceChanges", [])
+def _token_delta_from_transfers(payload: dict):
+    transfers = payload.get("tokenTransfers") or []
+    if not transfers or not TRACKED_WALLET:
+        return None, 0.0
+
+    deltas = {}
+    for t in transfers:
+        mint = t.get("mint")
+        amt = t.get("tokenAmount")
+        if mint is None or amt is None:
+            continue
+
+        amt = float(amt)
+        if t.get("toUserAccount") == TRACKED_WALLET:
+            deltas[mint] = deltas.get(mint, 0) + amt
+        if t.get("fromUserAccount") == TRACKED_WALLET:
+            deltas[mint] = deltas.get(mint, 0) - amt
+
+    if not deltas:
+        return None, 0.0
+
+    mint = max(deltas, key=lambda m: abs(deltas[m]))
+    return mint, deltas[mint]
+
+def _token_delta_from_balance_changes(account_entry: dict):
+    changes = account_entry.get("tokenBalanceChanges") or []
     if not changes:
         return None, 0.0
 
     deltas = {}
-    for c in changes:
-        mint = c.get("mint")
-        raw = c.get("rawTokenAmount", {})
-        amt = raw.get("tokenAmount")
-        dec = raw.get("decimals", 0)
+    for ch in changes:
+        mint = ch.get("mint")
+        raw = (ch.get("rawTokenAmount") or {}).get("tokenAmount")
+        dec = (ch.get("rawTokenAmount") or {}).get("decimals", 0)
 
-        if mint and amt:
-            qty = float(amt) / (10 ** dec)
+        if mint and raw:
+            qty = float(raw) / (10 ** int(dec))
             deltas[mint] = deltas.get(mint, 0) + qty
 
     if not deltas:
@@ -100,94 +120,70 @@ def extract_token_delta(account):
     mint = max(deltas, key=lambda m: abs(deltas[m]))
     return mint, deltas[mint]
 
-# =========================================================
-# PAPER TRADE ENGINE
-# =========================================================
+# ==========================================================
+# PAPER TRADE EXECUTION
+# ==========================================================
 
-def apply_paper_trade(payload):
-    account = find_user_account(payload)
-    if not account:
+def apply_paper_trade(payload: dict):
+    if not isinstance(payload, dict):
         return
 
-    mint, token_delta = extract_token_delta(account)
-    if not mint or token_delta == 0:
+    account = _find_user_account(payload)
+    sol_delta = float(account.get("nativeBalanceChange", 0)) / 1e9
+
+    mint, token_delta = _token_delta_from_transfers(payload)
+    if mint is None or token_delta == 0:
+        mint, token_delta = _token_delta_from_balance_changes(account)
+
+    if mint is None or token_delta == 0:
         return
 
-    side = "BUY" if token_delta > 0 else "SELL"
+    side = (
+        "BUY" if token_delta > 0 and sol_delta < 0
+        else "SELL" if token_delta < 0 and sol_delta > 0
+        else "UNKNOWN"
+    )
 
-    state = load_state()
+    trade_usd = abs(sol_delta) * SOL_PRICE_USD
+    fees_usd = FEE_FIXED_USD + trade_usd * FEE_PCT
 
-    if side == "BUY":
-        if state["cash"] < FIXED_TRADE_USD:
-            return
+    state = load_paper_state()
 
-        price = FIXED_TRADE_USD / abs(token_delta)
-
-        pos = state["positions"].get(mint, {
-            "qty": 0.0,
-            "avg_cost": 0.0
-        })
-
-        new_qty = pos["qty"] + token_delta
-        new_cost = (
-            (pos["qty"] * pos["avg_cost"]) +
-            FIXED_TRADE_USD
-        ) / new_qty
-
-        pos["qty"] = new_qty
-        pos["avg_cost"] = new_cost
-        state["positions"][mint] = pos
-        state["cash"] -= FIXED_TRADE_USD + FIXED_FEE_USD
-
-    else:  # SELL
-        pos = state["positions"].get(mint)
-        if not pos or pos["qty"] <= 0:
-            return
-
-        sell_qty = min(abs(token_delta), pos["qty"])
-        proceeds = sell_qty * pos["avg_cost"]
-
-        pos["qty"] -= sell_qty
-        state["cash"] += proceeds - FIXED_FEE_USD
-
-        if pos["qty"] <= 0:
-            del state["positions"][mint]
-        else:
-            state["positions"][mint] = pos
+    state["cash"] += (sol_delta * SOL_PRICE_USD) - fees_usd
+    state["positions"][mint] = state["positions"].get(mint, 0) + token_delta
 
     state["trades"].append({
-        "ts": utc_now(),
+        "ts": utc_now_iso(),
         "side": side,
         "mint": mint,
-        "qty": token_delta,
-        "trade_usd": FIXED_TRADE_USD,
-        "fee_usd": FIXED_FEE_USD,
-        "sig": payload.get("signature")
+        "token_delta": token_delta,
+        "sol_delta": sol_delta,
+        "trade_usd_est": trade_usd,
+        "fees_usd_est": fees_usd,
+        "sig": payload.get("signature"),
+        "desc": payload.get("description"),
     })
 
     state["trades"] = state["trades"][-200:]
-    save_state(state)
+    save_paper_state(state)
 
-# =========================================================
-# API
-# =========================================================
+# ==========================================================
+# ROUTES
+# ==========================================================
 
 @app.get("/health")
 def health():
-    return {"ok": True, "time": utc_now()}
+    return {"ok": True, "service": APP_NAME, "time": utc_now_iso()}
 
 @app.get("/paper/state")
 def paper_state():
-    return load_state()
+    return load_paper_state()
 
 @app.get("/events")
-def events():
-    ensure_logs()
+def get_events():
+    ensure_logfile()
     lines = EVENT_LOG.read_text().splitlines()[-200:]
-    return {
-        "count": len(lines),
-        "events": [json.loads(l) for l in lines]
-    }
+    return {"count": len(lines), "events": [json.loads(l) for l in lines]}
 
 @app.post("/webhook")
 async def webhook(
@@ -205,10 +201,10 @@ async def webhook(
 
     payload = await request.json()
 
-    append_event({
-        "received_at": utc_now(),
+    append_jsonl({
+        "received_at": utc_now_iso(),
         "source": "helius",
-        "payload": payload
+        "payload": payload,
     })
 
     if isinstance(payload, list):
