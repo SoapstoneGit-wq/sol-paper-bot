@@ -2,16 +2,12 @@ import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 APP_NAME = "sol-paper-bot"
-
-# =========
-# LOGGING
-# =========
 LOG_DIR = Path("logs")
 EVENT_LOG = LOG_DIR / "events.jsonl"
 
@@ -40,46 +36,43 @@ def append_jsonl(record: Dict[str, Any]) -> None:
 # =======================
 # PAPER TRADING STATE
 # =======================
+
 PAPER_STATE_FILE = Path("logs/paper_state.json")
 
 # ---- Paper trading realism knobs (USD) ----
 START_CASH_USD = 500.0
 
 MIN_TRADE_USD = 75.0          # avoid fee death
-MAX_TRADE_PCT = 0.15          # max 15% of cash per trade
+MAX_TRADE_PCT = 0.15          # max 15% per trade
 
-# Fee model (can be overridden by env vars)
+# Fees / estimates
 SOL_PRICE_USD = float(os.getenv("SOL_PRICE_USD", "100"))
-FEE_FIXED_USD = float(os.getenv("FEE_FIXED_USD", "1.00"))  # priority/compute/bribe baseline
-FEE_PCT = float(os.getenv("FEE_PCT", "0.020"))             # 2% slippage+impact estimate
+FEE_FIXED_USD = float(os.getenv("FEE_FIXED_USD", "1.00"))
+FEE_PCT = float(os.getenv("FEE_PCT", "0.020"))
 
 
-def load_paper_state() -> Dict[str, Any]:
+def load_paper_state():
     if not PAPER_STATE_FILE.exists():
         return {
             "cash": START_CASH_USD,
             "positions": {},
             "trades": []
         }
-    return json.loads(PAPER_STATE_FILE.read_text(encoding="utf-8"))
+    return json.loads(PAPER_STATE_FILE.read_text())
 
 
-def save_paper_state(state: Dict[str, Any]) -> None:
+def save_paper_state(state):
     PAPER_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    PAPER_STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    PAPER_STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
 # ===============================
-# HELIUS PARSING HELPERS
+# PAPER TRADE LOGIC
 # ===============================
 
 def _find_user_account(payload0: dict) -> dict:
-    """
-    Helius enhanced payload often includes accountData = [{account, nativeBalanceChange, tokenBalanceChanges}, ...]
-    We'll pick the accountData entry that actually has balance changes.
-    """
     account_data = payload0.get("accountData") or []
-    if not isinstance(account_data, list) or not account_data:
+    if not isinstance(account_data, list):
         return {}
 
     # Prefer one with token balance changes
@@ -92,18 +85,15 @@ def _find_user_account(payload0: dict) -> dict:
         if a.get("nativeBalanceChange", 0) != 0:
             return a
 
-    return account_data[0]
+    return account_data[0] if account_data else {}
 
 
-def _sum_token_delta_for_user(account_entry: dict) -> Tuple[Optional[str], float]:
-    """
-    Returns (mint, token_delta) for the biggest absolute token change in this event.
-    """
+def _sum_token_delta_for_user(account_entry: dict):
     tbc = account_entry.get("tokenBalanceChanges") or []
     if not isinstance(tbc, list) or not tbc:
         return (None, 0.0)
 
-    deltas: Dict[str, float] = {}
+    deltas = {}
     for ch in tbc:
         mint = ch.get("mint")
         raw = (ch.get("rawTokenAmount") or {}).get("tokenAmount")
@@ -126,99 +116,85 @@ def _sum_token_delta_for_user(account_entry: dict) -> Tuple[Optional[str], float
     return (mint, deltas[mint])
 
 
-# ===============================
-# PAPER TRADE LOGIC
-# ===============================
-
-def apply_paper_trade_from_helius(payload0: dict) -> None:
+def apply_paper_trade_from_helius(payload0: dict):
     """
     Convert ONE enhanced webhook payload object into a paper trade and update paper_state.json.
 
-    IMPORTANT:
-    - This does NOT execute real trades.
-    - It "paper trades" by updating cash/positions based on webhook balance deltas.
-    - It resizes the trade to OUR sizing rules:
-        min $75, max 15% of cash, baseline 2% of cash (but not below min).
+    PHASE 1:
+    We add debug logging so we can see which keys and fields are present in Helius payloads.
     """
     if not isinstance(payload0, dict):
+        return
+
+    evt_type = (payload0.get("type") or "").upper()
+
+    # ✅ PHASE 1 DEBUG: log the structure so we can see where real token movements live
+    append_jsonl({
+        "debug": True,
+        "ts": utc_now_iso(),
+        "event_type": payload0.get("type"),
+        "keys": list(payload0.keys()),
+        "has_accountData": "accountData" in payload0,
+        "has_events": "events" in payload0,
+        "has_tokenTransfers": "tokenTransfers" in payload0,
+        "has_nativeTransfers": "nativeTransfers" in payload0,
+        "desc": payload0.get("description"),
+        "sig": payload0.get("signature"),
+    })
+
+    # Keep current behavior: only try to paper-trade swap-like events
+    # (Helius sometimes labels swaps differently; we’ll fix parsing after we inspect debug logs)
+    if "SWAP" not in evt_type and "TOKEN_SWAP" not in evt_type:
         return
 
     account_entry = _find_user_account(payload0)
     if not account_entry:
         return
 
-    # SOL change (lamports -> SOL)
-    lamports = account_entry.get("nativeBalanceChange", 0) or 0
-    sol_delta = float(lamports) / 1e9
-
-    # Token change
+    sol_delta = float(account_entry.get("nativeBalanceChange", 0) or 0) / 1e9
     mint, token_delta = _sum_token_delta_for_user(account_entry)
+
     if mint is None or token_delta == 0:
         return
 
-    # Decide direction based on typical swap pattern
     # BUY: token up, SOL down
     # SELL: token down, SOL up
-    if token_delta > 0 and sol_delta < 0:
-        side = "BUY"
-    elif token_delta < 0 and sol_delta > 0:
-        side = "SELL"
-    else:
-        # not a clean swap pattern
-        return
+    side = "BUY" if (token_delta > 0 and sol_delta < 0) else "SELL" if (token_delta < 0 and sol_delta > 0) else "UNKNOWN"
+
+    trade_usd = abs(sol_delta) * SOL_PRICE_USD
+    fees_usd = FEE_FIXED_USD + (trade_usd * FEE_PCT)
 
     state = load_paper_state()
-    cash = float(state.get("cash", 0.0))
 
-    # OUR sizing: baseline 2% of cash but at least MIN_TRADE_USD
-    target_usd = max(MIN_TRADE_USD, cash * 0.02)
-    target_usd = min(target_usd, cash * MAX_TRADE_PCT, cash)
-
-    # If we can't even do minimum size, skip
-    if target_usd < MIN_TRADE_USD:
-        return
-
-    whale_trade_usd = abs(sol_delta) * SOL_PRICE_USD
-    if whale_trade_usd <= 0:
-        return
-
-    # Scale the whale's deltas to our target_usd
-    scale = target_usd / whale_trade_usd
-    scaled_sol_delta = sol_delta * scale
-    scaled_token_delta = token_delta * scale
-
-    fees_usd = FEE_FIXED_USD + (target_usd * FEE_PCT)
-
-    # Update cash (USD):
-    # If scaled_sol_delta is negative (we spent SOL), cash goes down.
-    state["cash"] = cash + (scaled_sol_delta * SOL_PRICE_USD) - fees_usd
+    # Update cash (USD)
+    state["cash"] = float(state.get("cash", 0.0)) + (sol_delta * SOL_PRICE_USD) - fees_usd
 
     # Update positions
     positions = state.get("positions") or {}
-    positions[mint] = float(positions.get(mint, 0.0)) + float(scaled_token_delta)
+    positions[mint] = float(positions.get(mint, 0.0)) + token_delta
     state["positions"] = positions
 
     # Append trade record
     trades = state.get("trades") or []
     trades.append({
         "ts": utc_now_iso(),
+        "type": evt_type,
         "side": side,
         "mint": mint,
-        "token_delta": scaled_token_delta,
-        "sol_delta": scaled_sol_delta,
-        "trade_usd_est": target_usd,
+        "token_delta": token_delta,
+        "sol_delta": sol_delta,
+        "trade_usd_est": trade_usd,
         "fees_usd_est": fees_usd,
         "sig": payload0.get("signature"),
-        "type": payload0.get("type"),
         "desc": payload0.get("description"),
     })
-    state["trades"] = trades[-200:]
+    state["trades"] = trades[-200:]  # keep last 200
 
     save_paper_state(state)
 
 
 # ===============================
-# API ROUTES
+# ROUTES
 # ===============================
 
 @app.get("/paper/state")
@@ -273,7 +249,6 @@ async def webhook(
     append_jsonl(record)
 
     # ==== PAPER TRADING ====
-    # Helius can send either a list of events or a single dict event
     if isinstance(payload, list):
         for evt in payload:
             apply_paper_trade_from_helius(evt)
