@@ -2,69 +2,34 @@ import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 APP_NAME = "sol-paper-bot"
+
+# =========================
+# LOGGING (raw webhook events)
+# =========================
 LOG_DIR = Path("logs")
 EVENT_LOG = LOG_DIR / "events.jsonl"
+PAPER_STATE_FILE = LOG_DIR / "paper_state.json"
 
-# =======================
-# ENV / SETTINGS (easy tune)
-# =======================
-
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
-
-# Paper account
-START_CASH_USD = float(os.getenv("START_CASH_USD", "500"))
-
-# How much YOU buy per whale buy (fixed USD per buy) — simplest + safest to start
-TRADE_USD_PER_BUY = float(os.getenv("TRADE_USD_PER_BUY", "100"))
-
-# Safety caps
-MAX_TRADE_PCT_OF_CASH = float(os.getenv("MAX_TRADE_PCT_OF_CASH", "0.25"))  # cap buy size relative to cash
-MIN_TRADE_USD = float(os.getenv("MIN_TRADE_USD", "20"))  # ignore tiny buys
-
-# Fees / realism
-FEE_FIXED_USD = float(os.getenv("FEE_FIXED_USD", "1.00"))
-FEE_PCT = float(os.getenv("FEE_PCT", "0.02"))
-
-# Price conversion (only used when payload gives SOL delta but not price directly)
-SOL_PRICE_USD = float(os.getenv("SOL_PRICE_USD", "100"))
-
-# Risk rules (the new stuff)
-STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.25"))          # 0.25 = -25%
-TRAIL_STOP_PCT = float(os.getenv("TRAIL_STOP_PCT", "0.20"))        # 0.20 = 20% off peak
-TRAIL_ARM_PROFIT_PCT = float(os.getenv("TRAIL_ARM_PROFIT_PCT", "0.30"))  # only arm trailing after +30%
-
-# Whale sell mirroring
-MIRROR_WHALE_SELLS = os.getenv("MIRROR_WHALE_SELLS", "true").lower() in ("1", "true", "yes")
-
-# Take profit ladder (optional)
-# Example: TAKE_PROFIT_PCTS="0.5,1.0,2.0" and TAKE_PROFIT_SELL_PCTS="0.25,0.25,0.25"
-TP_PCTS = [p.strip() for p in os.getenv("TAKE_PROFIT_PCTS", "").split(",") if p.strip()]
-TP_SELLS = [p.strip() for p in os.getenv("TAKE_PROFIT_SELL_PCTS", "").split(",") if p.strip()]
-TAKE_PROFIT_PCTS = [float(x) for x in TP_PCTS] if TP_PCTS else []
-TAKE_PROFIT_SELL_PCTS = [float(x) for x in TP_SELLS] if TP_SELLS else []
-
-# Tracked wallet filter (optional; you can leave blank and just log everything)
-TRACKED_WALLET = os.getenv("TRACKED_WALLET", "").strip()
-
-# =======================
-# APP
-# =======================
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 
 app = FastAPI(title=APP_NAME)
 
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
 
 def ensure_logfile() -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     if not EVENT_LOG.exists():
         EVENT_LOG.write_text("", encoding="utf-8")
+
 
 def append_jsonl(record: Dict[str, Any]) -> None:
     ensure_logfile()
@@ -72,97 +37,349 @@ def append_jsonl(record: Dict[str, Any]) -> None:
         f.write(json.dumps(record))
         f.write("\n")
 
-# =======================
+
+# =========================
+# TUNABLE SETTINGS (env vars)
+# =========================
+
+# Starting cash
+START_CASH_USD = float(os.getenv("START_CASH_USD", "500"))
+
+# How much we spend per BUY (paper)
+TRADE_USD = float(os.getenv("TRADE_USD", "100"))
+MIN_TRADE_USD = float(os.getenv("MIN_TRADE_USD", "25"))
+
+# Fees / slippage model
+FEE_FIXED_USD = float(os.getenv("FEE_FIXED_USD", "1.00"))
+FEE_PCT = float(os.getenv("FEE_PCT", "0.020"))  # 2%
+
+# When whale sells, we sell this fraction of our position (0.0 - 1.0)
+MIRROR_WHALE_SELL_PCT = float(os.getenv("MIRROR_WHALE_SELL_PCT", "1.0"))
+
+# Stop loss (e.g. 0.20 = 20% down from avg cost)
+STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.20"))
+
+# Trailing stop behavior
+TRAIL_ACTIVATE_PCT = float(os.getenv("TRAIL_ACTIVATE_PCT", "0.35"))  # start trailing after +35%
+TRAIL_PCT = float(os.getenv("TRAIL_PCT", "0.20"))  # trail distance 20%
+
+# Optional take-profit ladder
+# Example:
+# TAKE_PROFIT_LEVELS="0.40,1.00,2.00"  (40%, 100%, 200%)
+# TAKE_PROFIT_SELL_PCTS="0.25,0.25,0.25" (sell 25% each time)
+TP_LEVELS_STR = os.getenv("TAKE_PROFIT_LEVELS", "").strip()
+TP_SELLS_STR = os.getenv("TAKE_PROFIT_SELL_PCTS", "").strip()
+
+def _parse_csv_floats(s: str) -> List[float]:
+    if not s:
+        return []
+    out = []
+    for part in s.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        out.append(float(part))
+    return out
+
+TAKE_PROFIT_LEVELS = _parse_csv_floats(TP_LEVELS_STR)
+TAKE_PROFIT_SELL_PCTS = _parse_csv_floats(TP_SELLS_STR)
+
+# Default SOL price for estimating price when we only have SOL delta
+SOL_PRICE_USD = float(os.getenv("SOL_PRICE_USD", "100"))
+
+
+# =========================
 # PAPER STATE
-# =======================
-
-PAPER_STATE_FILE = LOG_DIR / "paper_state.json"
-
-def _default_state() -> dict:
-    return {
-        "cash": START_CASH_USD,
-        "positions": {},  # mint -> {qty, avg_cost_usd_per_token, last_price_usd, peak_price_usd, trail_stop_price_usd, tp_done[]}
-        "realized_pnl_usd": 0.0,
-        "trades": [],     # latest 200
-        "updated_at": utc_now_iso(),
-    }
+# =========================
 
 def load_paper_state() -> dict:
     if not PAPER_STATE_FILE.exists():
-        return _default_state()
+        return {
+            "cash": START_CASH_USD,
+            "positions": {},   # mint -> position object
+            "trades": []
+        }
     try:
         return json.loads(PAPER_STATE_FILE.read_text(encoding="utf-8"))
     except Exception:
-        return _default_state()
+        # If file gets corrupted for any reason, reset cleanly
+        return {
+            "cash": START_CASH_USD,
+            "positions": {},
+            "trades": []
+        }
+
 
 def save_paper_state(state: dict) -> None:
     PAPER_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    state["updated_at"] = utc_now_iso()
     PAPER_STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
-def _get_pos(state: dict, mint: str) -> dict:
-    pos = state["positions"].get(mint)
-    if not pos:
-        pos = {
+
+# ✅ THE FIX: prune dead positions so /paper/state stays readable
+def prune_zero_positions(state: dict) -> None:
+    positions = state.get("positions") or {}
+    to_delete = []
+    for mint, pos in positions.items():
+        try:
+            qty = float(pos.get("qty") or 0.0)
+            # prune 0 or negative, also prune NaN-ish
+            if qty <= 0:
+                to_delete.append(mint)
+        except Exception:
+            to_delete.append(mint)
+
+    for mint in to_delete:
+        del positions[mint]
+
+    state["positions"] = positions
+
+
+# =========================
+# HELPERS: compute equity / pnl snapshots
+# =========================
+
+def compute_portfolio_metrics(state: dict) -> Tuple[float, float, float, float]:
+    """
+    returns:
+      positions_value_usd, equity_usd, realized_pnl_usd, unrealized_pnl_usd
+    """
+    positions_value = 0.0
+    realized = 0.0
+    unrealized = 0.0
+
+    positions = state.get("positions") or {}
+    for mint, pos in positions.items():
+        qty = float(pos.get("qty") or 0.0)
+        last_price = pos.get("last_price_usd")
+        avg_cost = float(pos.get("avg_cost_usd_per_token") or 0.0)
+
+        if last_price is None:
+            # no valuation if we don't have price
+            continue
+
+        last_price = float(last_price)
+        positions_value += qty * last_price
+        unrealized += qty * (last_price - avg_cost)
+
+        realized += float(pos.get("realized_pnl_usd") or 0.0)
+
+    equity = float(state.get("cash") or 0.0) + positions_value
+    return positions_value, equity, realized, unrealized
+
+
+# =========================
+# PAPER TRADE EXECUTION
+# =========================
+
+def _fees_for_trade(trade_usd: float) -> float:
+    return FEE_FIXED_USD + trade_usd * FEE_PCT
+
+
+def _ensure_position(state: dict, mint: str) -> dict:
+    positions = state.setdefault("positions", {})
+    if mint not in positions:
+        tp_done = [False for _ in TAKE_PROFIT_LEVELS]
+        positions[mint] = {
             "qty": 0.0,
             "avg_cost_usd_per_token": 0.0,
             "last_price_usd": None,
-            "peak_price_usd": None,
-            "trail_stop_price_usd": None,
-            "tp_done": [False for _ in TAKE_PROFIT_PCTS],
+            "peak_price": None,
+            "trail_stop_price": None,
+            "tp_done": tp_done,
+            "realized_pnl_usd": 0.0,
         }
-        state["positions"][mint] = pos
-    # If TP config changed between deploys, fix tp_done length
-    if "tp_done" not in pos or not isinstance(pos["tp_done"], list):
-        pos["tp_done"] = [False for _ in TAKE_PROFIT_PCTS]
-    if len(pos["tp_done"]) != len(TAKE_PROFIT_PCTS):
-        pos["tp_done"] = [False for _ in TAKE_PROFIT_PCTS]
-    return pos
+    # If TP config changed since last run, keep array aligned
+    if TAKE_PROFIT_LEVELS:
+        cur = positions[mint].get("tp_done")
+        if not isinstance(cur, list) or len(cur) != len(TAKE_PROFIT_LEVELS):
+            positions[mint]["tp_done"] = [False for _ in TAKE_PROFIT_LEVELS]
+    return positions[mint]
 
-def _round2(x: float) -> float:
-    return float(f"{x:.6f}")
 
-def _trade_fee(trade_usd: float) -> float:
-    return FEE_FIXED_USD + trade_usd * FEE_PCT
+def paper_buy(state: dict, mint: str, price_usd: float, sig: Optional[str], desc: str = "") -> None:
+    cash = float(state.get("cash") or 0.0)
 
-# =======================
-# EXTRACT “SWAP” DELTAS FROM HELIUS
-# Supports: accountData tokenBalanceChanges/nativeBalanceChange
-# AND: tokenTransfers/nativeTransfers formats when present.
-# =======================
+    trade_usd = min(TRADE_USD, cash)  # can't spend more than cash
+    if trade_usd < MIN_TRADE_USD:
+        return
 
-def _sum_token_delta_from_accountdata(payload0: dict) -> Tuple[Optional[str], float, float]:
+    fees = _fees_for_trade(trade_usd)
+    if trade_usd + fees > cash and cash >= MIN_TRADE_USD:
+        # if fees push us over, shrink trade
+        trade_usd = max(MIN_TRADE_USD, cash - fees)
+
+    if trade_usd < MIN_TRADE_USD:
+        return
+
+    qty = trade_usd / price_usd
+
+    pos = _ensure_position(state, mint)
+    old_qty = float(pos.get("qty") or 0.0)
+    old_avg = float(pos.get("avg_cost_usd_per_token") or 0.0)
+
+    new_qty = old_qty + qty
+    new_avg = ((old_qty * old_avg) + (qty * price_usd)) / new_qty if new_qty > 0 else 0.0
+
+    pos["qty"] = new_qty
+    pos["avg_cost_usd_per_token"] = new_avg
+    pos["last_price_usd"] = price_usd
+
+    # update peak/trail
+    peak = pos.get("peak_price")
+    if peak is None or price_usd > float(peak):
+        pos["peak_price"] = price_usd
+        # if trailing already active, move trail up
+        if pos.get("trail_stop_price") is not None:
+            pos["trail_stop_price"] = price_usd * (1.0 - TRAIL_PCT)
+
+    # Cash update
+    state["cash"] = cash - trade_usd - fees
+
+    state.setdefault("trades", []).append({
+        "ts": utc_now_iso(),
+        "type": "SWAP",
+        "side": "BUY",
+        "mint": mint,
+        "qty": qty,
+        "price_usd_per_token": price_usd,
+        "trade_usd_est": trade_usd,
+        "fees_usd_est": fees,
+        "sig": sig,
+        "desc": desc or "",
+    })
+
+
+def paper_sell(state: dict, mint: str, price_usd: float, qty_to_sell: float, reason: str, sig: Optional[str], desc: str = "") -> None:
+    pos = (state.get("positions") or {}).get(mint)
+    if not pos:
+        return
+
+    held = float(pos.get("qty") or 0.0)
+    if held <= 0:
+        return
+
+    qty = min(max(qty_to_sell, 0.0), held)
+    if qty <= 0:
+        return
+
+    trade_usd = qty * price_usd
+    fees = _fees_for_trade(trade_usd)
+
+    avg_cost = float(pos.get("avg_cost_usd_per_token") or 0.0)
+    realized = (price_usd - avg_cost) * qty - fees
+
+    # Update position
+    pos["qty"] = held - qty
+    pos["last_price_usd"] = price_usd
+    pos["realized_pnl_usd"] = float(pos.get("realized_pnl_usd") or 0.0) + realized
+
+    # Cash update (we receive trade_usd - fees)
+    state["cash"] = float(state.get("cash") or 0.0) + (trade_usd - fees)
+
+    state.setdefault("trades", []).append({
+        "ts": utc_now_iso(),
+        "type": "SWAP",
+        "side": "SELL",
+        "mint": mint,
+        "qty": qty,
+        "price_usd_per_token": price_usd,
+        "trade_usd_est": trade_usd,
+        "fees_usd_est": fees,
+        "realized_pnl_net": realized,
+        "reason": reason,
+        "sig": sig,
+        "desc": desc or "",
+    })
+
+
+def apply_risk_checks(state: dict, mint: str, price_usd: float, sig: Optional[str]) -> None:
+    pos = (state.get("positions") or {}).get(mint)
+    if not pos:
+        return
+
+    qty = float(pos.get("qty") or 0.0)
+    if qty <= 0:
+        return
+
+    avg = float(pos.get("avg_cost_usd_per_token") or 0.0)
+    pos["last_price_usd"] = price_usd
+
+    # Update peak
+    peak = pos.get("peak_price")
+    if peak is None or price_usd > float(peak):
+        pos["peak_price"] = price_usd
+        # If trailing is active, move it up
+        if pos.get("trail_stop_price") is not None:
+            pos["trail_stop_price"] = price_usd * (1.0 - TRAIL_PCT)
+
+    # STOP LOSS (hard exit)
+    if avg > 0 and price_usd <= avg * (1.0 - STOP_LOSS_PCT):
+        paper_sell(state, mint, price_usd, qty, reason="STOP_LOSS", sig=sig)
+        return
+
+    # TAKE PROFITS (optional ladder)
+    if avg > 0 and TAKE_PROFIT_LEVELS and TAKE_PROFIT_SELL_PCTS:
+        tp_done = pos.get("tp_done") or [False for _ in TAKE_PROFIT_LEVELS]
+        for i, level in enumerate(TAKE_PROFIT_LEVELS):
+            if i >= len(TAKE_PROFIT_SELL_PCTS):
+                break
+            if i >= len(tp_done):
+                break
+            if tp_done[i]:
+                continue
+            target = avg * (1.0 + level)
+            if price_usd >= target:
+                sell_pct = TAKE_PROFIT_SELL_PCTS[i]
+                sell_qty = qty * sell_pct
+                paper_sell(state, mint, price_usd, sell_qty, reason=f"TAKE_PROFIT_{int(level*100)}PCT", sig=sig)
+                # refresh qty after sell
+                qty = float((state.get("positions") or {}).get(mint, {}).get("qty") or 0.0)
+                tp_done[i] = True
+                pos["tp_done"] = tp_done
+                if qty <= 0:
+                    return
+
+    # TRAILING STOP activation
+    if avg > 0:
+        gain = (price_usd / avg) - 1.0
+        if gain >= TRAIL_ACTIVATE_PCT and pos.get("trail_stop_price") is None:
+            pos["trail_stop_price"] = price_usd * (1.0 - TRAIL_PCT)
+
+    # TRAILING STOP trigger
+    trail = pos.get("trail_stop_price")
+    if trail is not None and price_usd <= float(trail):
+        paper_sell(state, mint, price_usd, qty, reason="TRAILING_STOP", sig=sig)
+        return
+
+
+# =========================
+# HELIUS EVENT PARSING
+# =========================
+
+def _find_user_account_entry(payload0: dict) -> dict:
     """
-    Returns (mint, token_delta, sol_delta) for the most significant token change.
-    Uses payload0["accountData"] entries.
+    Helius enhanced events often include accountData list with tokenBalanceChanges.
+    We'll try to find the entry that has tokenBalanceChanges, else fallback.
     """
     account_data = payload0.get("accountData") or []
     if not isinstance(account_data, list) or not account_data:
-        return None, 0.0, 0.0
+        return {}
 
-    # If TRACKED_WALLET set, prefer matching account entry
-    if TRACKED_WALLET:
-        for a in account_data:
-            if a.get("account") == TRACKED_WALLET:
-                mint, tok = _sum_token_delta_for_entry(a)
-                sol = float(a.get("nativeBalanceChange", 0.0)) / 1e9
-                return mint, tok, sol
-
-    # Otherwise pick the entry with meaningful token balance changes
-    best = None
     for a in account_data:
-        tbc = a.get("tokenBalanceChanges") or []
-        if tbc:
-            best = a
-            break
-    if not best:
-        best = account_data[0]
+        if (a.get("tokenBalanceChanges") or []) != []:
+            return a
 
-    mint, tok = _sum_token_delta_for_entry(best)
-    sol = float(best.get("nativeBalanceChange", 0.0)) / 1e9
-    return mint, tok, sol
+    for a in account_data:
+        if a.get("nativeBalanceChange", 0) != 0:
+            return a
 
-def _sum_token_delta_for_entry(account_entry: dict) -> Tuple[Optional[str], float]:
+    return account_data[0]
+
+
+def _sum_token_delta(account_entry: dict) -> Tuple[Optional[str], float]:
+    """
+    Returns (mint, delta_qty). Chooses mint with largest absolute delta.
+    """
     tbc = account_entry.get("tokenBalanceChanges") or []
     if not tbc:
         return None, 0.0
@@ -174,7 +391,10 @@ def _sum_token_delta_for_entry(account_entry: dict) -> Tuple[Optional[str], floa
         dec = (ch.get("rawTokenAmount") or {}).get("decimals", 0)
         if mint is None or raw is None:
             continue
-        qty = float(raw) / (10 ** int(dec))
+        try:
+            qty = float(raw) / (10 ** int(dec))
+        except Exception:
+            continue
         deltas[mint] = deltas.get(mint, 0.0) + qty
 
     if not deltas:
@@ -183,308 +403,101 @@ def _sum_token_delta_for_entry(account_entry: dict) -> Tuple[Optional[str], floa
     mint = max(deltas, key=lambda m: abs(deltas[m]))
     return mint, float(deltas[mint])
 
-def _sum_deltas_from_transfers(payload0: dict) -> Tuple[Optional[str], float, float]:
+
+def _estimate_price_usd(sol_delta: float, token_delta: float) -> Optional[float]:
     """
-    Returns (mint, token_delta, sol_delta) using tokenTransfers/nativeTransfers.
-    Only works if those arrays exist.
+    Estimate token USD price from SOL delta and token delta.
+    Only valid for swaps where SOL moved opposite token.
     """
-    token_transfers = payload0.get("tokenTransfers") or []
-    native_transfers = payload0.get("nativeTransfers") or []
+    if token_delta == 0:
+        return None
+    if sol_delta == 0:
+        return None
 
-    if not isinstance(token_transfers, list) or not isinstance(native_transfers, list):
-        return None, 0.0, 0.0
+    # We only trust when signs oppose (buy uses SOL, receive token; sell gives token, receive SOL)
+    if (token_delta > 0 and sol_delta < 0) or (token_delta < 0 and sol_delta > 0):
+        trade_usd = abs(sol_delta) * SOL_PRICE_USD
+        if trade_usd <= 0:
+            return None
+        price = trade_usd / abs(token_delta)
+        # ignore nonsense
+        if price <= 0 or price > 1e9:
+            return None
+        return price
 
-    # Track deltas for the tracked wallet if set
-    token_deltas: Dict[str, float] = {}
-    sol_delta = 0.0
+    return None
 
-    if TRACKED_WALLET:
-        for nt in native_transfers:
-            try:
-                amt_sol = float(nt.get("amount", 0.0)) / 1e9
-                frm = nt.get("fromUserAccount")
-                to = nt.get("toUserAccount")
-                if frm == TRACKED_WALLET:
-                    sol_delta -= amt_sol
-                if to == TRACKED_WALLET:
-                    sol_delta += amt_sol
-            except Exception:
-                pass
-
-        for tt in token_transfers:
-            try:
-                mint = tt.get("mint")
-                amt = tt.get("tokenAmount")
-                if mint is None or amt is None:
-                    continue
-                amt = float(amt)
-                frm = tt.get("fromUserAccount")
-                to = tt.get("toUserAccount")
-                if frm == TRACKED_WALLET:
-                    token_deltas[mint] = token_deltas.get(mint, 0.0) - amt
-                if to == TRACKED_WALLET:
-                    token_deltas[mint] = token_deltas.get(mint, 0.0) + amt
-            except Exception:
-                pass
-    else:
-        # If no tracked wallet, we can't confidently sign deltas.
-        return None, 0.0, 0.0
-
-    if not token_deltas:
-        return None, 0.0, sol_delta
-
-    mint = max(token_deltas, key=lambda m: abs(token_deltas[m]))
-    return mint, float(token_deltas[mint]), float(sol_delta)
-
-def extract_trade_deltas(payload0: dict) -> Tuple[Optional[str], float, float]:
-    """
-    Best-effort extraction:
-    - Prefer accountData if present
-    - Else try transfers
-    """
-    mint, tok, sol = _sum_token_delta_from_accountdata(payload0)
-    if mint is not None and tok != 0.0:
-        return mint, tok, sol
-
-    mint2, tok2, sol2 = _sum_deltas_from_transfers(payload0)
-    if mint2 is not None and tok2 != 0.0:
-        return mint2, tok2, sol2
-
-    return None, 0.0, 0.0
-
-# =======================
-# EXECUTE PAPER TRADES
-# =======================
-
-def paper_buy(state: dict, mint: str, price_usd: float, trade_usd: float, sig: Optional[str], desc: str = "") -> None:
-    if trade_usd < MIN_TRADE_USD:
-        return
-    # cap by cash
-    max_by_cash = max(0.0, state["cash"] * MAX_TRADE_PCT_OF_CASH)
-    trade_usd = min(trade_usd, max_by_cash) if max_by_cash > 0 else 0.0
-    if trade_usd < MIN_TRADE_USD:
-        return
-
-    fee = _trade_fee(trade_usd)
-    total_cost = trade_usd + fee
-    if total_cost > state["cash"]:
-        return
-
-    qty = trade_usd / max(price_usd, 1e-12)
-
-    pos = _get_pos(state, mint)
-    old_qty = float(pos["qty"])
-    old_avg = float(pos["avg_cost_usd_per_token"]) if pos["avg_cost_usd_per_token"] else 0.0
-
-    new_qty = old_qty + qty
-    new_avg = ((old_qty * old_avg) + (qty * price_usd)) / max(new_qty, 1e-12)
-
-    pos["qty"] = _round2(new_qty)
-    pos["avg_cost_usd_per_token"] = float(new_avg)
-    pos["last_price_usd"] = float(price_usd)
-
-    # peak / trail bookkeeping
-    peak = pos["peak_price_usd"]
-    if peak is None or price_usd > peak:
-        pos["peak_price_usd"] = float(price_usd)
-
-    state["cash"] = _round2(state["cash"] - total_cost)
-
-    state["trades"].append({
-        "ts": utc_now_iso(),
-        "type": "SWAP",
-        "side": "BUY",
-        "mint": mint,
-        "qty": qty,
-        "price_usd_per_token": price_usd,
-        "trade_usd_est": trade_usd,
-        "fees_usd_est": fee,
-        "sig": sig,
-        "desc": desc,
-    })
-
-def paper_sell(state: dict, mint: str, price_usd: float, sell_qty: float, reason: str, sig: Optional[str]) -> None:
-    pos = _get_pos(state, mint)
-    held = float(pos["qty"])
-    if held <= 0:
-        return
-
-    sell_qty = min(sell_qty, held)
-    if sell_qty <= 0:
-        return
-
-    proceeds = sell_qty * price_usd
-    fee = _trade_fee(proceeds)  # fee on sell proceeds (simple model)
-    net = proceeds - fee
-
-    avg = float(pos["avg_cost_usd_per_token"]) if pos["avg_cost_usd_per_token"] else 0.0
-    cost_basis = sell_qty * avg
-    realized = net - cost_basis
-
-    state["cash"] = _round2(state["cash"] + net)
-    state["realized_pnl_usd"] = _round2(state.get("realized_pnl_usd", 0.0) + realized)
-
-    pos["qty"] = _round2(held - sell_qty)
-    pos["last_price_usd"] = float(price_usd)
-
-    # If fully closed, reset trailing/peak/tp flags
-    if pos["qty"] <= 0:
-        pos["qty"] = 0.0
-        pos["peak_price_usd"] = None
-        pos["trail_stop_price_usd"] = None
-        pos["tp_done"] = [False for _ in TAKE_PROFIT_PCTS]
-
-    state["trades"].append({
-        "ts": utc_now_iso(),
-        "type": "SWAP",
-        "side": "SELL",
-        "mint": mint,
-        "qty": sell_qty,
-        "price_usd_per_token": price_usd,
-        "trade_usd_est": proceeds,
-        "fees_usd_est": fee,
-        "realized_pnl_net": realized,
-        "reason": reason,
-        "sig": sig,
-        "desc": "",
-    })
-
-def update_risk_rules(state: dict, mint: str, price_usd: float, sig: Optional[str]) -> None:
-    """
-    Called on any price update for a mint we hold.
-    Implements:
-      - Stop loss
-      - Trailing stop (armed after profit threshold)
-      - Take profit ladder (optional)
-    """
-    pos = _get_pos(state, mint)
-    qty = float(pos["qty"])
-    if qty <= 0:
-        return
-
-    pos["last_price_usd"] = float(price_usd)
-
-    avg = float(pos["avg_cost_usd_per_token"]) if pos["avg_cost_usd_per_token"] else 0.0
-    if avg <= 0:
-        return
-
-    # peak tracking
-    peak = pos["peak_price_usd"]
-    if peak is None or price_usd > peak:
-        peak = float(price_usd)
-        pos["peak_price_usd"] = peak
-
-    # hard stop loss
-    stop_price = avg * (1.0 - STOP_LOSS_PCT)
-    if price_usd <= stop_price:
-        paper_sell(state, mint, price_usd, qty, reason=f"STOP_LOSS_{STOP_LOSS_PCT}", sig=sig)
-        return
-
-    # optional take-profits
-    if TAKE_PROFIT_PCTS and TAKE_PROFIT_SELL_PCTS and len(TAKE_PROFIT_PCTS) == len(TAKE_PROFIT_SELL_PCTS):
-        pnl_pct = (price_usd - avg) / avg
-        for i, tp in enumerate(TAKE_PROFIT_PCTS):
-            if i >= len(pos["tp_done"]):
-                break
-            if pos["tp_done"][i]:
-                continue
-            if pnl_pct >= tp:
-                sell_part = float(TAKE_PROFIT_SELL_PCTS[i])
-                sell_qty = qty * sell_part
-                paper_sell(state, mint, price_usd, sell_qty, reason=f"TAKE_PROFIT_{tp}", sig=sig)
-                # refresh qty after sell
-                qty = float(_get_pos(state, mint)["qty"])
-                pos["tp_done"][i] = True
-                if qty <= 0:
-                    return
-
-    # trailing stop (only after armed)
-    pnl_pct_now = (price_usd - avg) / avg
-    if pnl_pct_now >= TRAIL_ARM_PROFIT_PCT:
-        trail_stop = peak * (1.0 - TRAIL_STOP_PCT)
-        pos["trail_stop_price_usd"] = float(trail_stop)
-        if price_usd <= trail_stop:
-            paper_sell(state, mint, price_usd, qty, reason=f"TRAIL_STOP_{TRAIL_STOP_PCT}", sig=sig)
-            return
 
 def apply_paper_from_helius_event(payload0: dict) -> None:
     """
-    Main handler:
-    - Extract mint/token_delta/sol_delta
-    - Determine BUY/SELL
-    - Determine an estimated price if possible
-    - Execute:
-        BUY: fixed TRADE_USD_PER_BUY
-        SELL: if MIRROR_WHALE_SELLS -> sell proportional or full
-    - Then run risk rules (stop/trail/tp)
+    Called for each event from webhook.
+    Decides buy/sell and applies risk logic.
     """
-    if not isinstance(payload0, dict):
-        return
-
-    mint, token_delta, sol_delta = extract_trade_deltas(payload0)
-    if mint is None or token_delta == 0.0:
-        return
+    state = load_paper_state()
 
     sig = payload0.get("signature")
     desc = payload0.get("description") or payload0.get("desc") or ""
 
-    # Determine a usable price estimate
-    price_usd: Optional[float] = None
-    if sol_delta != 0.0:
-        trade_usd_from_sol = abs(sol_delta) * SOL_PRICE_USD
-        price_usd = trade_usd_from_sol / max(abs(token_delta), 1e-12)
+    account_entry = _find_user_account_entry(payload0)
+    if not account_entry:
+        return
 
-    state = load_paper_state()
-    pos = _get_pos(state, mint)
+    sol_delta = float(account_entry.get("nativeBalanceChange", 0) or 0.0) / 1e9
+    mint, token_delta = _sum_token_delta(account_entry)
+    if mint is None or token_delta == 0:
+        return
 
-    # If we don't have price from this event, fall back to last price (if any)
-    if price_usd is None:
-        last = pos.get("last_price_usd")
-        if last is None:
-            # Can't act without any price reference
-            return
-        price_usd = float(last)
+    # Try to estimate a price
+    price = _estimate_price_usd(sol_delta, token_delta)
 
     # Decide side
-    # Typical swap:
-    #   BUY  => token_delta > 0 and sol_delta < 0
-    #   SELL => token_delta < 0 and sol_delta > 0
-    # Some payloads may not include sol_delta — in that case we infer by token_delta sign only.
-    if token_delta > 0:
-        # WHALE BUY => OUR BUY
-        paper_buy(
-            state=state,
-            mint=mint,
-            price_usd=price_usd,
-            trade_usd=TRADE_USD_PER_BUY,
-            sig=sig,
-            desc=desc,
-        )
-        # Update risk (in case this price becomes peak etc.)
-        update_risk_rules(state, mint, price_usd, sig=sig)
+    # BUY: token up, SOL down
+    if token_delta > 0 and sol_delta < 0:
+        if price is None:
+            # No price → cannot simulate correctly → skip trade, but still log raw event in /events
+            return
+        paper_buy(state, mint, price_usd=price, sig=sig, desc=desc)
+
+        # after buy, run risk checks (updates peak/trail if needed)
+        apply_risk_checks(state, mint, price_usd=price, sig=sig)
+
+    # SELL signal: token down, SOL up
+    elif token_delta < 0 and sol_delta > 0:
+        if price is None:
+            # If no price, we can't simulate; skip
+            return
+
+        # Mirror whale sell (% of our position)
+        pos = (state.get("positions") or {}).get(mint)
+        if pos and float(pos.get("qty") or 0.0) > 0:
+            held = float(pos.get("qty") or 0.0)
+            sell_qty = held * max(0.0, min(1.0, MIRROR_WHALE_SELL_PCT))
+            paper_sell(state, mint, price_usd=price, qty_to_sell=sell_qty, reason="MIRROR_WHALE_SELL", sig=sig, desc=desc)
+
+        # risk checks still apply (trail could trigger etc.)
+        apply_risk_checks(state, mint, price_usd=price, sig=sig)
 
     else:
-        # token_delta < 0 => WHALE SOLD token
-        # Update price + run risk first (price update matters)
-        update_risk_rules(state, mint, price_usd, sig=sig)
+        # Not a clean swap we can interpret
+        return
 
-        if MIRROR_WHALE_SELLS:
-            held_qty = float(_get_pos(state, mint)["qty"])
-            if held_qty > 0:
-                # Simple mirror: sell 100% of what we hold when whale sells (safest for “copy”)
-                paper_sell(state, mint, price_usd, held_qty, reason="MIRROR_WHALE_SELL", sig=sig)
+    # keep trades bounded
+    state["trades"] = (state.get("trades") or [])[-200:]
 
-    # Keep trades list bounded
-    state["trades"] = state["trades"][-200:]
+    # ✅ prune dead positions (THE FIX)
+    prune_zero_positions(state)
+
     save_paper_state(state)
 
-# =======================
-# API
-# =======================
+
+# =========================
+# API ENDPOINTS
+# =========================
 
 @app.get("/health")
 def health():
     return {"ok": True, "service": APP_NAME, "time": utc_now_iso()}
+
 
 @app.get("/events")
 def get_events():
@@ -492,28 +505,24 @@ def get_events():
     lines = EVENT_LOG.read_text(encoding="utf-8").splitlines()[-200:]
     return {"count": len(lines), "events": [json.loads(l) for l in lines]}
 
+
 @app.get("/paper/state")
 def paper_state():
     state = load_paper_state()
+    prune_zero_positions(state)  # also prune on read, just in case
 
-    # Compute unrealized + equity for display
-    positions_value = 0.0
-    for mint, pos in (state.get("positions") or {}).items():
-        qty = float(pos.get("qty") or 0.0)
-        last = pos.get("last_price_usd")
-        if qty > 0 and last is not None:
-            positions_value += qty * float(last)
+    positions_value, equity, realized, unrealized = compute_portfolio_metrics(state)
 
-    cash = float(state.get("cash") or 0.0)
-    realized = float(state.get("realized_pnl_usd") or 0.0)
-    equity = cash + positions_value
-    unrealized = equity - START_CASH_USD - realized
+    return {
+        "cash": float(state.get("cash") or 0.0),
+        "positions": state.get("positions") or {},
+        "positions_value_usd": positions_value,
+        "equity_usd": equity,
+        "realized_pnl_usd": realized,
+        "unrealized_pnl_usd": unrealized,
+        "trades": (state.get("trades") or [])[-200:],
+    }
 
-    state_out = dict(state)
-    state_out["positions_value_usd"] = positions_value
-    state_out["equity_usd"] = equity
-    state_out["unrealized_pnl_usd"] = unrealized
-    return state_out
 
 @app.post("/webhook")
 async def webhook(
@@ -522,13 +531,13 @@ async def webhook(
     authorization: Optional[str] = Header(default=None),
 ):
     # Accept secret from multiple possible headers
-    provided = x_webhook_secret or authorization or ""
+    provided = (x_webhook_secret or authorization or "").strip()
 
     # Authorization: Bearer <secret>
     if provided.lower().startswith("bearer "):
         provided = provided[7:].strip()
 
-    # If user pasted "x-webhook-secret: value" into provider field, tolerate it
+    # If someone mistakenly sends "x-webhook-secret: <value>" as the header value
     if provided.lower().startswith("x-webhook-secret"):
         parts = provided.split(":", 1)
         if len(parts) == 2:
@@ -539,14 +548,19 @@ async def webhook(
 
     payload = await request.json()
 
-    # Log raw payload
-    record = {"received_at": utc_now_iso(), "source": "helius", "payload": payload}
+    # Log raw event
+    record = {
+        "received_at": utc_now_iso(),
+        "source": "helius",
+        "payload": payload,
+    }
     append_jsonl(record)
 
     # Apply paper trading
     if isinstance(payload, list):
         for evt in payload:
-            apply_paper_from_helius_event(evt)
+            if isinstance(evt, dict):
+                apply_paper_from_helius_event(evt)
     elif isinstance(payload, dict):
         apply_paper_from_helius_event(payload)
 
