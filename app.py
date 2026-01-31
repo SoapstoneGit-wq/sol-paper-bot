@@ -1,455 +1,396 @@
 import os
 import json
 import time
-from typing import Any, Dict, List, Optional, Tuple
-from fastapi import FastAPI, Request, Header, HTTPException
+from typing import Dict, Any, List, Optional
+
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 
-app = FastAPI(title="sol-paper-bot", version="2.0-fastapi-only")
+# ----------------------------
+# Config
+# ----------------------------
+APP_NAME = "sol-paper-bot"
+STATE_FILE = "paper_state.json"
 
-# -----------------------------
-# ENV / CONFIG
-# -----------------------------
-TRACKED_WALLETS = [w.strip() for w in os.getenv("TRACKED_WALLET", "").split(",") if w.strip()]
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
-SOL_PRICE_USD = float(os.getenv("SOL_PRICE_USD", "100"))  # used to derive token price from SOL change
+WEBHOOK_SECRET_ENV = "WEBHOOK_SECRET"
+START_CASH_ENV = "START_CASH_USD"
 
-# Aggressive behavior (scalping meme launches)
-STARTING_CASH_USD = float(os.getenv("STARTING_CASH_USD", "500"))
-MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "12"))
-MIN_TRADE_USD = float(os.getenv("MIN_TRADE_USD", "10"))
-MAX_TRADE_USD = float(os.getenv("MAX_TRADE_USD", "80"))
-TRADE_FRACTION_OF_TRADABLE = float(os.getenv("TRADE_FRACTION_OF_TRADABLE", "0.08"))  # 8% of tradable cash
-SLIPPAGE_BPS = float(os.getenv("SLIPPAGE_BPS", "150"))  # 1.5% simulated slippage
-FEE_FIXED_USD = float(os.getenv("FEE_FIXED_USD", "0.25"))  # per trade (buy or sell)
-
-# Profit locking (house money extraction)
-# If a single closed trade ROI >= threshold, lock a fraction of PROFIT into locked_cash
-PROFIT_LOCK_ROI = float(os.getenv("PROFIT_LOCK_ROI", "0.50"))  # 50%+
-PROFIT_LOCK_FRACTION = float(os.getenv("PROFIT_LOCK_FRACTION", "0.50"))  # lock 50% of profit
-
-# Optional: extra aggressive "big win" lock (e.g., 10x / 100x)
-BIG_WIN_ROI = float(os.getenv("BIG_WIN_ROI", "10.0"))  # 10x+
-BIG_WIN_LOCK_FRACTION = float(os.getenv("BIG_WIN_LOCK_FRACTION", "0.70"))  # lock 70% of profit
-
-STATE_PATH = os.getenv("STATE_PATH", "paper_state.json")
+# Profit split rule:
+# If a completed trade (buy->sell) had >= 50% return, split profit:
+#   - 50% of PROFIT goes to reserve_cash_usd (protected, not used for buying)
+#   - 50% of PROFIT remains in cash_usd (compounds trading bankroll)
+PROFIT_SPLIT_MIN_RETURN = 0.50  # 50%
+PROFIT_SPLIT_MAX_RETURN = 100.0  # 10,000% = 100x return as decimal (100.0)
+PROFIT_SPLIT_RATIO_TO_RESERVE = 0.50  # 50% to reserve
 
 
-# -----------------------------
-# STATE
-# -----------------------------
-def now_ts() -> float:
-    return time.time()
+# ----------------------------
+# App
+# ----------------------------
+app = FastAPI(title=APP_NAME)
+
+# ----------------------------
+# In-memory state
+# ----------------------------
+DEFAULT_STATE = {
+    "started_at": None,
+    "cash_usd": None,
+    "reserve_cash_usd": 0.0,  # protected profits
+    "positions": {},          # token_mint -> position object
+    "events": [],             # last N webhook events
+    "trades": [],             # closed trades history
+    "counters": {
+        "webhooks_received": 0,
+        "webhooks_unauthorized": 0,
+        "buys": 0,
+        "sells": 0,
+    },
+}
+
+state: Dict[str, Any] = {}
 
 
+# ----------------------------
+# Helpers: state persistence
+# ----------------------------
 def load_state() -> Dict[str, Any]:
-    if os.path.exists(STATE_PATH):
-        try:
-            with open(STATE_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
+    # If no file, initialize fresh
+    if not os.path.exists(STATE_FILE):
+        s = json.loads(json.dumps(DEFAULT_STATE))
+        s["started_at"] = int(time.time())
+        start_cash = float(os.getenv(START_CASH_ENV, "500"))
+        s["cash_usd"] = start_cash
+        return s
 
-    # default state
-    return {
-        "created_at": now_ts(),
-        "cash": STARTING_CASH_USD,
-        "locked_cash": 0.0,          # cannot be used for new buys
-        "tradable_cash": STARTING_CASH_USD,  # cash available for new trades
-        "realized_pnl_usd": 0.0,
-        "positions": {},  # mint -> position
-        "events": [],
-        "count": 0,
+    try:
+        with open(STATE_FILE, "r") as f:
+            s = json.load(f)
+        # Backfill any missing keys
+        for k, v in DEFAULT_STATE.items():
+            if k not in s:
+                s[k] = json.loads(json.dumps(v))
+        if s["started_at"] is None:
+            s["started_at"] = int(time.time())
+        if s["cash_usd"] is None:
+            s["cash_usd"] = float(os.getenv(START_CASH_ENV, "500"))
+        if "reserve_cash_usd" not in s:
+            s["reserve_cash_usd"] = 0.0
+        return s
+    except Exception:
+        # If corrupted, reset safely
+        s = json.loads(json.dumps(DEFAULT_STATE))
+        s["started_at"] = int(time.time())
+        s["cash_usd"] = float(os.getenv(START_CASH_ENV, "500"))
+        return s
+
+
+def save_state(s: Dict[str, Any]) -> None:
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(s, f, indent=2)
+    except Exception as e:
+        # Don’t crash the server if saving fails
+        print("WARN: failed to save state:", str(e))
+
+
+def trim_events(s: Dict[str, Any], keep: int = 200) -> None:
+    if len(s["events"]) > keep:
+        s["events"] = s["events"][-keep:]
+
+
+def trim_trades(s: Dict[str, Any], keep: int = 500) -> None:
+    if len(s["trades"]) > keep:
+        s["trades"] = s["trades"][-keep:]
+
+
+# ----------------------------
+# Helpers: webhook auth (robust)
+# ----------------------------
+def get_webhook_secret_from_request(request: Request) -> str:
+    """
+    Accepts multiple formats:
+    1) x-webhook-secret: <secret>
+    2) Authorization: <secret>   (fallback)
+    3) If provider accidentally sends "x-webhook-secret: <secret>" as the VALUE, parse it.
+    """
+    val = request.headers.get("x-webhook-secret") or request.headers.get("X-Webhook-Secret")
+
+    if not val:
+        val = request.headers.get("authorization") or request.headers.get("Authorization")
+
+    if not val:
+        return ""
+
+    val = val.strip()
+
+    # If value looks like: "x-webhook-secret: the_secret"
+    if ":" in val and val.lower().startswith("x-webhook-secret"):
+        _, maybe_secret = val.split(":", 1)
+        val = maybe_secret.strip()
+
+    return val
+
+
+def require_valid_webhook(request: Request) -> None:
+    expected = (os.getenv(WEBHOOK_SECRET_ENV) or "").strip()
+    if not expected:
+        raise HTTPException(status_code=500, detail=f"Server misconfigured: {WEBHOOK_SECRET_ENV} missing")
+
+    got = get_webhook_secret_from_request(request)
+
+    if not got or got != expected:
+        state["counters"]["webhooks_unauthorized"] += 1
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+# ----------------------------
+# Helpers: paper trading bookkeeping
+# ----------------------------
+def open_or_add_position(token_mint: str, usd_spent: float, token_qty: float, price_usd: float) -> None:
+    """
+    Simple average-cost position.
+    """
+    pos = state["positions"].get(token_mint)
+    if not pos:
+        pos = {
+            "token_mint": token_mint,
+            "qty": 0.0,
+            "avg_cost_usd_per_token": 0.0,
+            "total_cost_usd": 0.0,
+            "opened_at": int(time.time()),
+            "last_price_usd": price_usd,
+            "peak_price_usd": price_usd,
+        }
+
+    new_total_cost = pos["total_cost_usd"] + usd_spent
+    new_qty = pos["qty"] + token_qty
+
+    # Avoid divide-by-zero
+    if new_qty > 0:
+        pos["avg_cost_usd_per_token"] = new_total_cost / new_qty
+
+    pos["qty"] = new_qty
+    pos["total_cost_usd"] = new_total_cost
+    pos["last_price_usd"] = price_usd
+    pos["peak_price_usd"] = max(pos.get("peak_price_usd", price_usd), price_usd)
+
+    state["positions"][token_mint] = pos
+
+
+def close_position(token_mint: str, price_usd: float, reason: str = "sell") -> Optional[Dict[str, Any]]:
+    """
+    Sells full position at price_usd and returns closed trade record.
+    Applies profit split rule if return >= 50% and <= 10,000%.
+    """
+    pos = state["positions"].get(token_mint)
+    if not pos or pos["qty"] <= 0:
+        return None
+
+    qty = float(pos["qty"])
+    total_cost = float(pos["total_cost_usd"])
+    proceeds = qty * price_usd
+    pnl = proceeds - total_cost
+
+    # Return as decimal: (proceeds / cost) - 1
+    ret = (proceeds / total_cost - 1.0) if total_cost > 0 else 0.0
+
+    # Put proceeds back into cash (paper)
+    state["cash_usd"] += proceeds
+
+    # Profit split: only applies if pnl > 0 and return in range
+    reserved = 0.0
+    if pnl > 0 and (ret >= PROFIT_SPLIT_MIN_RETURN) and (ret <= PROFIT_SPLIT_MAX_RETURN):
+        reserved = pnl * PROFIT_SPLIT_RATIO_TO_RESERVE
+        # Move from cash -> reserve (protected)
+        state["cash_usd"] -= reserved
+        state["reserve_cash_usd"] += reserved
+
+    trade = {
+        "token_mint": token_mint,
+        "qty": qty,
+        "avg_cost_usd_per_token": pos["avg_cost_usd_per_token"],
+        "sell_price_usd": price_usd,
+        "total_cost_usd": total_cost,
+        "proceeds_usd": proceeds,
+        "pnl_usd": pnl,
+        "return_decimal": ret,
+        "reserved_profit_usd": reserved,
+        "reason": reason,
+        "opened_at": pos.get("opened_at"),
+        "closed_at": int(time.time()),
+        "peak_price_usd": pos.get("peak_price_usd", price_usd),
     }
 
+    # Remove position
+    del state["positions"][token_mint]
+    state["trades"].append(trade)
+    trim_trades(state)
 
-def save_state(state: Dict[str, Any]) -> None:
-    tmp = STATE_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2, sort_keys=True)
-    os.replace(tmp, STATE_PATH)
-
-
-STATE = load_state()
+    return trade
 
 
-def clamp(x: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, x))
+# ----------------------------
+# Minimal “decision” logic (safe defaults)
+# ----------------------------
+def maybe_paper_buy(token_mint: str, price_usd: float) -> Optional[Dict[str, Any]]:
+    """
+    Placeholder buy logic.
+    You can replace this later with your real strategy.
+    For now:
+      - Buys a small fixed amount ONLY if we do not already hold the token.
+    """
+    if token_mint in state["positions"]:
+        return None
+
+    # Only use trading cash (NOT reserve)
+    cash = float(state["cash_usd"])
+    buy_usd = min(10.0, cash)  # tiny test buy
+    if buy_usd <= 0.0 or price_usd <= 0.0:
+        return None
+
+    token_qty = buy_usd / price_usd
+    state["cash_usd"] -= buy_usd
+    open_or_add_position(token_mint, usd_spent=buy_usd, token_qty=token_qty, price_usd=price_usd)
+    state["counters"]["buys"] += 1
+
+    return {"action": "buy", "token_mint": token_mint, "usd": buy_usd, "qty": token_qty, "price_usd": price_usd}
 
 
-def bps_to_mult(bps: float) -> float:
-    return 1.0 + (bps / 10_000.0)
+def maybe_paper_sell(token_mint: str, price_usd: float) -> Optional[Dict[str, Any]]:
+    """
+    Placeholder sell logic.
+    For now:
+      - If we have a position and return >= 20%, sell.
+    """
+    pos = state["positions"].get(token_mint)
+    if not pos:
+        return None
 
+    avg = float(pos["avg_cost_usd_per_token"])
+    if avg <= 0 or price_usd <= 0:
+        return None
 
-# -----------------------------
-# HELIUS PARSING HELPERS
-# -----------------------------
-def _as_list(payload: Any) -> List[Dict[str, Any]]:
-    # Helius can send a list of tx objects or a single object
-    if isinstance(payload, list):
-        return [p for p in payload if isinstance(p, dict)]
-    if isinstance(payload, dict):
-        # sometimes your server wraps it
-        if "events" in payload and isinstance(payload["events"], list):
-            return [p for p in payload["events"] if isinstance(p, dict)]
-        return [payload]
-    return []
+    ret = (price_usd / avg) - 1.0
+    if ret >= 0.20:
+        trade = close_position(token_mint, price_usd, reason="take_profit_20pct")
+        state["counters"]["sells"] += 1
+        return {"action": "sell", "trade": trade}
 
-
-def extract_accountdata(tx: Dict[str, Any]) -> List[Dict[str, Any]]:
-    # Common places Helius enhanced payload stores account data
-    # Your screenshot showed payload.accountData[...]
-    p = tx.get("payload", tx)
-    if isinstance(p, dict) and isinstance(p.get("accountData"), list):
-        return [x for x in p["accountData"] if isinstance(x, dict)]
-    # fallback
-    if isinstance(tx.get("accountData"), list):
-        return [x for x in tx["accountData"] if isinstance(x, dict)]
-    return []
-
-
-def find_wallet_account_row(account_data: List[Dict[str, Any]], wallet: str) -> Optional[Dict[str, Any]]:
-    for row in account_data:
-        if row.get("account") == wallet:
-            return row
+    # Update last/peak
+    pos["last_price_usd"] = price_usd
+    pos["peak_price_usd"] = max(pos.get("peak_price_usd", price_usd), price_usd)
+    state["positions"][token_mint] = pos
     return None
 
 
-def token_change_for_wallet_row(wallet_row: Dict[str, Any]) -> List[Dict[str, Any]]:
-    # row.tokenBalanceChanges = [{"mint":..., "rawTokenAmount":..., "tokenAmount":..., "decimals":...}, ...]
-    tbc = wallet_row.get("tokenBalanceChanges", [])
-    if not isinstance(tbc, list):
-        return []
-    return [x for x in tbc if isinstance(x, dict) and x.get("mint")]
-
-
-def native_change_sol(wallet_row: Dict[str, Any]) -> float:
-    # nativeBalanceChange is in lamports in Helius enhanced
-    lamports = wallet_row.get("nativeBalanceChange", 0)
-    try:
-        lamports = float(lamports)
-    except Exception:
-        lamports = 0.0
-    return lamports / 1_000_000_000.0
-
-
-def token_amount_change(tc: Dict[str, Any]) -> float:
+# ----------------------------
+# Parse Helius Enhanced payload (best-effort)
+# ----------------------------
+def extract_token_mint_and_price(payload: Any) -> Optional[Dict[str, Any]]:
     """
-    tokenBalanceChanges typically includes:
-      - tokenAmount (already scaled) OR rawTokenAmount + decimals
-    We'll prefer tokenAmount if present, else derive.
+    Helius enhanced webhooks vary. We do best-effort extraction.
+    If we can't find anything, we just store the event.
+
+    This tries:
+      - payload may be list[events]
+      - token mint could appear in tokenBalanceChanges[].mint
+      - price is not always included; if missing, we skip buy/sell decisions
     """
-    if "tokenAmount" in tc:
-        try:
-            return float(tc["tokenAmount"])
-        except Exception:
-            pass
+    # Many Helius webhooks send a list of tx objects
+    events = payload if isinstance(payload, list) else [payload]
 
-    raw = tc.get("rawTokenAmount", None)
-    dec = tc.get("decimals", None)
-    try:
-        raw_f = float(raw)
-        dec_i = int(dec) if dec is not None else 0
-        return raw_f / (10 ** dec_i)
-    except Exception:
-        return 0.0
-
-
-def derive_token_price_usd(sol_change: float, token_delta: float) -> Optional[float]:
-    # If wallet spent SOL to get tokens: sol_change negative, token_delta positive
-    # price per token = (abs(sol_change)*SOL_PRICE_USD)/token_delta
-    if token_delta == 0:
-        return None
-    usd_value = abs(sol_change) * SOL_PRICE_USD
-    price = usd_value / abs(token_delta)
-    if price <= 0:
-        return None
-    return price
-
-
-# -----------------------------
-# TRADING LOGIC (PAPER)
-# -----------------------------
-def ensure_position(mint: str) -> Dict[str, Any]:
-    pos = STATE["positions"].get(mint)
-    if not pos:
-        pos = {
-            "mint": mint,
-            "qty": 0.0,
-            "avg_cost_usd_per_token": 0.0,
-            "last_price_usd": 0.0,
-            "peak_price_usd": 0.0,
-            "opened_at": now_ts(),
-            "last_update": now_ts(),
-            "trade_count": 0,
-        }
-        STATE["positions"][mint] = pos
-    return pos
-
-
-def open_positions_count() -> int:
-    c = 0
-    for p in STATE["positions"].values():
-        try:
-            if float(p.get("qty", 0)) > 0:
-                c += 1
-        except Exception:
-            pass
-    return c
-
-
-def compute_buy_budget_usd() -> float:
-    tradable = float(STATE.get("tradable_cash", 0.0))
-    budget = tradable * TRADE_FRACTION_OF_TRADABLE
-    budget = clamp(budget, MIN_TRADE_USD, MAX_TRADE_USD)
-    return budget
-
-
-def apply_slippage(price: float, is_buy: bool) -> float:
-    # buys pay worse (higher), sells receive worse (lower)
-    mult = bps_to_mult(SLIPPAGE_BPS)
-    return price * (mult if is_buy else (1.0 / mult))
-
-
-def paper_buy(mint: str, price_usd: float, signal_token_delta: float, signal_sol_change: float) -> Dict[str, Any]:
-    # keep "aggressive scalping": buy whenever tracked wallet buys, subject to cash/limits
-    if open_positions_count() >= MAX_OPEN_POSITIONS and float(ensure_position(mint)["qty"]) <= 0:
-        return {"action": "skip_buy", "reason": "max_open_positions"}
-
-    budget = compute_buy_budget_usd()
-    if STATE["tradable_cash"] < budget + FEE_FIXED_USD:
-        return {"action": "skip_buy", "reason": "insufficient_tradable_cash", "need": budget + FEE_FIXED_USD}
-
-    exec_price = apply_slippage(price_usd, is_buy=True)
-    qty = budget / exec_price if exec_price > 0 else 0.0
-    if qty <= 0:
-        return {"action": "skip_buy", "reason": "bad_qty"}
-
-    pos = ensure_position(mint)
-    old_qty = float(pos["qty"])
-    old_avg = float(pos["avg_cost_usd_per_token"])
-
-    new_qty = old_qty + qty
-    new_avg = ((old_qty * old_avg) + (qty * exec_price)) / new_qty if new_qty > 0 else 0.0
-
-    pos["qty"] = new_qty
-    pos["avg_cost_usd_per_token"] = new_avg
-    pos["last_price_usd"] = exec_price
-    pos["peak_price_usd"] = max(float(pos.get("peak_price_usd", 0.0)), exec_price)
-    pos["last_update"] = now_ts()
-    pos["trade_count"] = int(pos.get("trade_count", 0)) + 1
-
-    # cash movement
-    STATE["tradable_cash"] -= (budget + FEE_FIXED_USD)
-    STATE["cash"] = STATE["locked_cash"] + STATE["tradable_cash"]
-
-    return {
-        "action": "buy",
-        "mint": mint,
-        "budget_usd": budget,
-        "exec_price_usd": exec_price,
-        "qty_bought": qty,
-        "pos_qty": new_qty,
-        "pos_avg": new_avg,
-        "signal": {"token_delta": signal_token_delta, "sol_change": signal_sol_change},
-    }
-
-
-def maybe_lock_profit(realized_profit_usd: float, roi: float) -> float:
-    """
-    Returns amount locked.
-    Locks only PROFIT (not principal).
-    """
-    if realized_profit_usd <= 0:
-        return 0.0
-
-    lock_frac = 0.0
-    if roi >= BIG_WIN_ROI:
-        lock_frac = BIG_WIN_LOCK_FRACTION
-    elif roi >= PROFIT_LOCK_ROI:
-        lock_frac = PROFIT_LOCK_FRACTION
-
-    lock_amt = realized_profit_usd * lock_frac
-    if lock_amt > 0:
-        STATE["locked_cash"] += lock_amt
-        STATE["tradable_cash"] += (realized_profit_usd - lock_amt)
-    else:
-        STATE["tradable_cash"] += realized_profit_usd
-
-    # keep total cash consistent (principal returns elsewhere)
-    STATE["cash"] = STATE["locked_cash"] + STATE["tradable_cash"]
-    return lock_amt
-
-
-def paper_sell_all(mint: str, price_usd: float, signal_token_delta: float, signal_sol_change: float) -> Dict[str, Any]:
-    pos = ensure_position(mint)
-    qty = float(pos.get("qty", 0.0))
-    if qty <= 0:
-        return {"action": "skip_sell", "reason": "no_position"}
-
-    exec_price = apply_slippage(price_usd, is_buy=False)
-    proceeds = qty * exec_price
-    cost_basis = qty * float(pos.get("avg_cost_usd_per_token", 0.0))
-    realized_profit = proceeds - cost_basis - FEE_FIXED_USD
-
-    roi = (proceeds - FEE_FIXED_USD) / cost_basis - 1.0 if cost_basis > 0 else 0.0
-
-    # principal always returns to tradable cash
-    STATE["tradable_cash"] += cost_basis
-    # now add profit and lock a portion
-    locked = maybe_lock_profit(realized_profit, roi)
-
-    STATE["realized_pnl_usd"] += realized_profit
-    STATE["cash"] = STATE["locked_cash"] + STATE["tradable_cash"]
-
-    # reset position
-    pos["qty"] = 0.0
-    pos["avg_cost_usd_per_token"] = 0.0
-    pos["last_price_usd"] = exec_price
-    pos["peak_price_usd"] = max(float(pos.get("peak_price_usd", 0.0)), exec_price)
-    pos["last_update"] = now_ts()
-    pos["trade_count"] = int(pos.get("trade_count", 0)) + 1
-
-    return {
-        "action": "sell_all",
-        "mint": mint,
-        "exec_price_usd": exec_price,
-        "qty_sold": qty,
-        "proceeds_usd": proceeds,
-        "cost_basis_usd": cost_basis,
-        "realized_profit_usd": realized_profit,
-        "roi": roi,
-        "locked_profit_usd": locked,
-        "signal": {"token_delta": signal_token_delta, "sol_change": signal_sol_change},
-        "cash": {
-            "locked_cash": STATE["locked_cash"],
-            "tradable_cash": STATE["tradable_cash"],
-            "total_cash": STATE["cash"],
-        },
-    }
-
-
-def handle_wallet_token_changes(wallet: str, wallet_row: Dict[str, Any]) -> List[Dict[str, Any]]:
-    results: List[Dict[str, Any]] = []
-    sol_change = native_change_sol(wallet_row)  # + means received SOL, - means spent SOL
-    tchanges = token_change_for_wallet_row(wallet_row)
-
-    for tc in tchanges:
-        mint = tc.get("mint")
-        token_delta = token_amount_change(tc)
-
-        # If we can't infer a meaningful trade price, skip trading but still log
-        price = derive_token_price_usd(sol_change, token_delta)
-        if price is None:
-            results.append({
-                "action": "skip",
-                "reason": "no_price",
-                "wallet": wallet,
-                "mint": mint,
-                "sol_change": sol_change,
-                "token_delta": token_delta,
-            })
+    # We’ll just scan for the first mint we can find
+    for ev in events:
+        if not isinstance(ev, dict):
             continue
 
-        # BUY signal: spent SOL (negative), token increased (positive)
-        if sol_change < 0 and token_delta > 0:
-            results.append(paper_buy(mint, price, token_delta, sol_change))
-            continue
+        tbc = ev.get("tokenBalanceChanges") or []
+        if isinstance(tbc, list) and len(tbc) > 0:
+            first = tbc[0]
+            if isinstance(first, dict):
+                mint = first.get("mint")
+                if mint:
+                    # price_usd is often NOT included; leave None
+                    return {"token_mint": mint, "price_usd": None}
 
-        # SELL signal: received SOL (positive), token decreased (negative)
-        if sol_change > 0 and token_delta < 0:
-            results.append(paper_sell_all(mint, price, token_delta, sol_change))
-            continue
-
-        # Otherwise: update mark price if position exists
-        pos = ensure_position(mint)
-        pos["last_price_usd"] = price
-        pos["peak_price_usd"] = max(float(pos.get("peak_price_usd", 0.0)), price)
-        pos["last_update"] = now_ts()
-        results.append({
-            "action": "mark",
-            "wallet": wallet,
-            "mint": mint,
-            "price_usd": price,
-            "sol_change": sol_change,
-            "token_delta": token_delta,
-        })
-
-    return results
+    return None
 
 
-# -----------------------------
-# API
-# -----------------------------
+# ----------------------------
+# Routes
+# ----------------------------
+@app.on_event("startup")
+async def on_startup():
+    global state
+    state = load_state()
+    save_state(state)
+    print(f"{APP_NAME} started. cash_usd={state['cash_usd']} reserve_cash_usd={state['reserve_cash_usd']}")
+
+
 @app.get("/health")
-def health():
-    return {"ok": True, "service": "sol-paper-bot", "framework": "fastapi", "ts": now_ts()}
-
-
-@app.post("/webhook")
-async def webhook(
-    request: Request,
-    x_webhook_secret: Optional[str] = Header(default=None, convert_underscores=False),
-):
-    # auth
-    if WEBHOOK_SECRET:
-        if not x_webhook_secret or x_webhook_secret != WEBHOOK_SECRET:
-            raise HTTPException(status_code=401, detail="Unauthorized (bad x-webhook-secret)")
-
-    payload = await request.json()
-    txs = _as_list(payload)
-
-    event_record = {
-        "received_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "source": "helius",
-        "tx_count": len(txs),
-        "raw": payload,  # keep raw for debugging
-        "actions": [],
-    }
-
-    actions: List[Dict[str, Any]] = []
-
-    for tx in txs:
-        account_data = extract_accountdata(tx)
-        if not account_data:
-            continue
-
-        for wallet in TRACKED_WALLETS:
-            row = find_wallet_account_row(account_data, wallet)
-            if not row:
-                continue
-
-            actions.extend(handle_wallet_token_changes(wallet, row))
-
-    event_record["actions"] = actions
-
-    # store event
-    STATE["count"] = int(STATE.get("count", 0)) + 1
-    STATE["events"].insert(0, event_record)
-    STATE["events"] = STATE["events"][:200]  # cap memory
-    save_state(STATE)
-
-    return JSONResponse({"ok": True, "actions": actions, "cash": {
-        "locked_cash": STATE["locked_cash"],
-        "tradable_cash": STATE["tradable_cash"],
-        "total_cash": STATE["cash"],
-        "realized_pnl_usd": STATE["realized_pnl_usd"],
-    }})
+async def health():
+    return {"ok": True, "service": APP_NAME}
 
 
 @app.get("/events")
-def events():
-    return {"count": STATE.get("count", 0), "events": STATE.get("events", [])}
+async def get_events():
+    return {"count": len(state["events"]), "events": state["events"]}
 
 
 @app.get("/paper/state")
-def paper_state():
-    # return a lighter view
+async def paper_state():
     return {
-        "cash": STATE.get("cash", 0.0),
-        "locked_cash": STATE.get("locked_cash", 0.0),
-        "tradable_cash": STATE.get("tradable_cash", 0.0),
-        "realized_pnl_usd": STATE.get("realized_pnl_usd", 0.0),
-        "positions": STATE.get("positions", {}),
-        "count": STATE.get("count", 0),
+        "cash_usd": state["cash_usd"],
+        "reserve_cash_usd": state["reserve_cash_usd"],
+        "positions": state["positions"],
+        "trades_count": len(state["trades"]),
+        "counters": state["counters"],
+        "started_at": state["started_at"],
     }
+
+
+@app.get("/paper/trades")
+async def paper_trades():
+    return {"count": len(state["trades"]), "trades": state["trades"]}
+
+
+@app.post("/webhook")
+async def webhook(request: Request):
+    # 1) Auth
+    require_valid_webhook(request)
+
+    # 2) Read payload
+    payload = await request.json()
+
+    # 3) Store event (trimmed)
+    state["counters"]["webhooks_received"] += 1
+    state["events"].append({
+        "received_at": int(time.time()),
+        "source": "helius",
+        "payload": payload,   # NOTE: can be big; kept trimmed to last 200
+    })
+    trim_events(state)
+
+    # 4) Best-effort extract token mint and price
+    extracted = extract_token_mint_and_price(payload)
+
+    actions: List[Dict[str, Any]] = []
+
+    # If we can’t extract price, we can’t do buy/sell decisions reliably.
+    # But webhook + auth + storage will still work (no more 401 if headers match).
+    if extracted and extracted.get("token_mint"):
+        token_mint = extracted["token_mint"]
+        price_usd = extracted.get("price_usd")
+
+        # If you later add price extraction, these actions will trigger.
+        if isinstance(price_usd, (int, float)) and price_usd > 0:
+            a1 = maybe_paper_sell(token_mint, float(price_usd))
+            if a1:
+                actions.append(a1)
+
+            a2 = maybe_paper_buy(token_mint, float(price_usd))
+            if a2:
+                actions.append(a2)
+
+    save_state(state)
+    return JSONResponse({"ok": True, "actions": actions})
