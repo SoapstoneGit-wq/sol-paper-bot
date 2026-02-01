@@ -1,297 +1,334 @@
 import os
 import time
-import hmac
-from typing import Any, Dict, List, Optional, Set
-from fastapi import FastAPI, Request, Header, HTTPException
+from typing import Any, Dict, List, Optional, Tuple
+
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
-app = FastAPI()
 
-# -----------------------------
-# Config (Environment Variables)
-# -----------------------------
-def _get_float(name: str, default: float) -> float:
-    raw = os.getenv(name)
-    if raw is None or raw == "":
-        return float(default)
-    return float(raw)
+# ----------------------------
+# Config helpers
+# ----------------------------
+def env_float(name: str, default: float) -> float:
+    v = os.getenv(name)
+    if v is None or v == "":
+        return default
+    try:
+        return float(v)
+    except ValueError:
+        return default
 
-def _get_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
-    if raw is None or raw == "":
-        return int(default)
-    return int(raw)
 
-def _parse_wallets(raw: str) -> Set[str]:
-    # Accept comma-separated. Trim whitespace. Ignore empties.
-    # Example: "addr1,addr2, addr3"
-    wallets = set()
-    for part in (raw or "").split(","):
-        w = part.strip()
-        if w:
-            wallets.add(w)
+def env_int(name: str, default: int) -> int:
+    v = os.getenv(name)
+    if v is None or v == "":
+        return default
+    try:
+        return int(v)
+    except ValueError:
+        return default
+
+
+def get_tracked_wallets() -> List[str]:
+    # Accept comma-separated list (no spaces required; spaces are fine too)
+    raw = os.getenv("TRACKED_WALLET", "") or ""
+    wallets = [w.strip() for w in raw.split(",") if w.strip()]
     return wallets
 
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
-TRACKED_WALLETS_RAW = os.getenv("TRACKED_WALLET", "")
-TRACKED_WALLETS: Set[str] = _parse_wallets(TRACKED_WALLETS_RAW)
 
-START_CASH_USD = _get_float("START_CASH_USD", 500.0)
+def now_ts() -> int:
+    return int(time.time())
 
-# 60% reserve / 40% tradable:
-# Reserve is for forced exits / safety.
-RESERVE_PCT = _get_float("RESERVE_PCT", 0.60)  # 0.60 means 60% reserve
-TRADABLE_PCT = max(0.0, min(1.0, 1.0 - RESERVE_PCT))
 
-MIN_CASH_LEFT_USD = _get_float("MIN_CASH_LEFT_USD", 100.0)
-MAX_BUY_USD = _get_float("MAX_BUY_USD", 25.0)
+# ----------------------------
+# App + State
+# ----------------------------
+app = FastAPI()
 
-# Forced exit (dead coin) timer
-HOLD_MAX_SECONDS = _get_int("HOLD_MAX_SECONDS", 900)  # 900 seconds = 15 minutes
+START_CASH_USD = env_float("START_CASH_USD", 500.0)
+MAX_BUY_USD = env_float("MAX_BUY_USD", 25.0)
+MIN_CASH_LEFT_USD = env_float("MIN_CASH_LEFT_USD", 100.0)
 
-# If we don't know price, use a conservative fallback:
-# 0.5 means we assume you get 50% back on forced exit (bad exit).
-FORCED_EXIT_FALLBACK_MULTI = _get_float("FORCED_EXIT_FALLBACK_MULTI", 0.50)
+# 60% reserve / 40% tradable
+RESERVE_PCT = env_float("RESERVE_PCT", 0.60)
+TRADABLE_PCT = 1.0 - RESERVE_PCT
 
-# Optional; only used if you later want to estimate USD from SOL amounts
-SOL_PRICE_USD = _get_float("SOL_PRICE_USD", 115.0)
+# Forced exit for dead coins (seconds)
+HOLD_MAX_SECONDS = env_int("HOLD_MAX_SECONDS", 900)  # 900 seconds = 15 minutes
 
-EVENTS_LIMIT = 200
+# If we force-exit and don't know price, sell at this multiple of cost basis
+# 0.5 = assume we get back 50% of what we spent (tunable)
+FORCED_EXIT_FALLBACK_MULTI = env_float("FORCED_EXIT_FALLBACK_MULTI", 0.50)
 
-# -----------------------------
-# In-memory state
-# -----------------------------
-state: Dict[str, Any] = {
-    "started_at": int(time.time()),
+# Optional — only used for display/debug; paper trading logic here is USD-based
+SOL_PRICE_USD = env_float("SOL_PRICE_USD", 115.0)
+
+# Auth secret
+WEBHOOK_SECRET = (os.getenv("WEBHOOK_SECRET", "") or "").strip()
+
+# In-memory state (resets on deploy/restart)
+STATE: Dict[str, Any] = {
+    "started_at": now_ts(),
+    "cash_usd": round(START_CASH_USD * TRADABLE_PCT, 2),
+    "reserve_cash_usd": round(START_CASH_USD * RESERVE_PCT, 2),
+    "positions": {},  # mint -> {qty, cost_usd, opened_at, last_update}
+    "events": [],     # recent webhook payload summaries (sanitized-ish)
+    "trades": [],     # recent trades
+    "trades_count": 0,
     "counters": {
         "webhooks_received": 0,
         "webhooks_unauthorized": 0,
+        "skipped_no_secret": 0,
+        "skipped_bad_payload": 0,
         "buys": 0,
         "sells": 0,
         "forced_exits": 0,
         "skipped_low_cash": 0,
-        "skipped_no_secret": 0,
-        "skipped_no_signal": 0,
     },
-    "events": [],  # last N authorized webhook payload summaries
-    "positions": {},  # mint -> position
-    "trades": [],  # trade log
 }
 
-# Split starting cash into reserve + tradable
-# Tradable is what you can buy with; reserve is protected cash.
-state["reserve_cash_usd"] = round(START_CASH_USD * RESERVE_PCT, 4)
-state["cash_usd"] = round(START_CASH_USD * TRADABLE_PCT, 4)
+
+def clamp_recent(list_obj: List[Any], max_len: int = 200) -> None:
+    if len(list_obj) > max_len:
+        del list_obj[:-max_len]
 
 
-# -----------------------------
-# Helpers
-# -----------------------------
-def _constant_time_equal(a: str, b: str) -> bool:
-    return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
-
-def _auth_ok(x_webhook_secret: Optional[str], authorization: Optional[str]) -> bool:
+def auth_ok(request: Request) -> Tuple[bool, str]:
     """
-    Accept either:
-      - Header: x-webhook-secret: <secret>
-      - Header: Authorization: Bearer <secret>
+    Helius "Authentication Header" should be:
+      x-webhook-secret: <YOUR_SECRET>
+
+    We check header value against WEBHOOK_SECRET.
+    We do NOT log the actual secret; only lengths.
     """
-    if not WEBHOOK_SECRET:
-        # If you forgot to set WEBHOOK_SECRET, block everything.
-        state["counters"]["skipped_no_secret"] += 1
-        return False
+    expected = WEBHOOK_SECRET.strip()
+    if not expected:
+        # If secret not set in env, fail closed (safer)
+        return False, "WEBHOOK_SECRET not set"
 
-    if x_webhook_secret and _constant_time_equal(x_webhook_secret.strip(), WEBHOOK_SECRET.strip()):
-        return True
+    provided = request.headers.get("x-webhook-secret", "")
+    if provided is None:
+        provided = ""
+    provided = provided.strip()
 
-    if authorization:
-        # allow "Bearer <secret>"
-        parts = authorization.strip().split()
-        if len(parts) == 2 and parts[0].lower() == "bearer":
-            token = parts[1].strip()
-            if _constant_time_equal(token, WEBHOOK_SECRET.strip()):
-                return True
+    if not provided:
+        return False, "missing header x-webhook-secret"
 
-    return False
+    if provided != expected:
+        # Safe debug info (no secret leakage)
+        return False, f"secret mismatch (provided_len={len(provided)} expected_len={len(expected)})"
 
-def _now() -> int:
-    return int(time.time())
+    return True, "ok"
 
-def _add_event(item: Dict[str, Any]) -> None:
-    ev = state["events"]
-    ev.append(item)
-    if len(ev) > EVENTS_LIMIT:
-        del ev[: len(ev) - EVENTS_LIMIT]
 
-def _trade_log(entry: Dict[str, Any]) -> None:
-    state["trades"].append(entry)
-    # keep it from growing forever
-    if len(state["trades"]) > 500:
-        del state["trades"][:200]
+def extract_swaps(payload: Any) -> List[Dict[str, Any]]:
+    """
+    Helius enhanced webhook commonly sends payload as a list of tx objects.
+    We look for tx with type == "SWAP".
+    """
+    swaps: List[Dict[str, Any]] = []
+    if isinstance(payload, list):
+        for tx in payload:
+            if isinstance(tx, dict) and tx.get("type") == "SWAP":
+                swaps.append(tx)
+    elif isinstance(payload, dict):
+        # Sometimes payload is wrapped
+        maybe = payload.get("payload")
+        if isinstance(maybe, list):
+            for tx in maybe:
+                if isinstance(tx, dict) and tx.get("type") == "SWAP":
+                    swaps.append(tx)
+    return swaps
 
-def _force_exit_if_needed() -> None:
-    """Close any position older than HOLD_MAX_SECONDS using fallback."""
-    now = _now()
-    to_close = []
-    for mint, pos in state["positions"].items():
-        age = now - pos["opened_at"]
+
+def classify_swap_for_tracked_wallets(tx: Dict[str, Any], tracked: List[str]) -> Optional[Dict[str, Any]]:
+    """
+    Very lightweight classification:
+      - If tokenTransfers shows a mint transferred TO a tracked wallet => treat as BUY signal for that mint
+      - If tokenTransfers shows a mint transferred FROM a tracked wallet => treat as SELL signal for that mint
+
+    We ignore SOL mint (So111...) for "coin" mint detection.
+    """
+    transfers = tx.get("tokenTransfers") or []
+    if not isinstance(transfers, list) or not transfers:
+        return None
+
+    # Find first non-SOL mint transfer involving tracked wallets
+    for t in transfers:
+        if not isinstance(t, dict):
+            continue
+        mint = t.get("mint")
+        if not mint or not isinstance(mint, str):
+            continue
+        if mint.startswith("So11111111111111111111111111111111111111112"):
+            continue
+
+        to_user = t.get("toUserAccount")
+        from_user = t.get("fromUserAccount")
+
+        # BUY: tokens to tracked wallet
+        if isinstance(to_user, str) and to_user in tracked:
+            return {"side": "BUY", "mint": mint, "tracked_wallet": to_user}
+
+        # SELL: tokens from tracked wallet
+        if isinstance(from_user, str) and from_user in tracked:
+            return {"side": "SELL", "mint": mint, "tracked_wallet": from_user}
+
+    return None
+
+
+def forced_exit_if_needed() -> None:
+    """
+    Force-exit positions older than HOLD_MAX_SECONDS.
+    Since this is paper-trading without live prices, we sell at cost * FORCED_EXIT_FALLBACK_MULTI.
+    """
+    if HOLD_MAX_SECONDS <= 0:
+        return
+
+    ts = now_ts()
+    positions: Dict[str, Any] = STATE["positions"]
+    to_close: List[str] = []
+
+    for mint, pos in positions.items():
+        opened = int(pos.get("opened_at", ts))
+        age = ts - opened
         if age >= HOLD_MAX_SECONDS:
             to_close.append(mint)
 
     for mint in to_close:
-        pos = state["positions"].pop(mint, None)
+        pos = positions.get(mint)
         if not pos:
             continue
+        cost = float(pos.get("cost_usd", 0.0))
+        qty = float(pos.get("qty", 0.0))
+        proceeds = round(cost * FORCED_EXIT_FALLBACK_MULTI, 2)
 
-        invested = float(pos["invested_usd"])
-        returned = round(invested * FORCED_EXIT_FALLBACK_MULTI, 4)
+        # Close
+        del positions[mint]
 
-        # Returned funds go to tradable cash (but you still keep reserve intact)
-        state["cash_usd"] = round(state["cash_usd"] + returned, 4)
+        # Realize PnL
+        pnl = round(proceeds - cost, 2)
 
-        state["counters"]["forced_exits"] += 1
-        _trade_log({
-            "ts": _now(),
-            "type": "FORCED_EXIT",
+        # Cash handling: reserve only takes a share of positive profit
+        if pnl > 0:
+            reserve_add = round(pnl * RESERVE_PCT, 2)
+            cash_add = round(pnl - reserve_add, 2)
+            STATE["reserve_cash_usd"] = round(float(STATE["reserve_cash_usd"]) + reserve_add, 2)
+            STATE["cash_usd"] = round(float(STATE["cash_usd"]) + cost + cash_add, 2)
+        else:
+            # Loss stays in tradable cash
+            STATE["cash_usd"] = round(float(STATE["cash_usd"]) + proceeds, 2)
+
+        STATE["trades_count"] += 1
+        STATE["counters"]["forced_exits"] += 1
+        STATE["counters"]["sells"] += 1
+        STATE["trades"].append({
+            "ts": ts,
+            "side": "FORCED_SELL",
             "mint": mint,
-            "invested_usd": invested,
-            "returned_usd": returned,
-            "held_seconds": now - pos["opened_at"],
+            "qty": qty,
+            "cost_usd": cost,
+            "proceeds_usd": proceeds,
+            "pnl_usd": pnl,
+            "reason": f"hold>{HOLD_MAX_SECONDS}s",
         })
+        clamp_recent(STATE["trades"], 200)
 
-def _available_to_buy() -> float:
-    # Always keep MIN_CASH_LEFT_USD in tradable cash untouched
-    return max(0.0, float(state["cash_usd"]) - float(MIN_CASH_LEFT_USD))
 
-def _paper_buy(mint: str, reason: str) -> None:
-    _force_exit_if_needed()
+def paper_buy(mint: str) -> bool:
+    cash = float(STATE["cash_usd"])
+    # keep MIN_CASH_LEFT_USD available
+    if cash - MAX_BUY_USD < MIN_CASH_LEFT_USD:
+        STATE["counters"]["skipped_low_cash"] += 1
+        return False
 
-    if mint in state["positions"]:
-        # Already holding
-        return
-
-    avail = _available_to_buy()
-    if avail <= 0:
-        state["counters"]["skipped_low_cash"] += 1
-        return
-
-    spend = round(min(MAX_BUY_USD, avail), 4)
+    spend = round(min(MAX_BUY_USD, cash - MIN_CASH_LEFT_USD), 2)
     if spend <= 0:
-        state["counters"]["skipped_low_cash"] += 1
-        return
+        STATE["counters"]["skipped_low_cash"] += 1
+        return False
 
-    state["cash_usd"] = round(float(state["cash_usd"]) - spend, 4)
-    state["positions"][mint] = {
-        "mint": mint,
-        "invested_usd": spend,
-        "opened_at": _now(),
-        "reason": reason,
+    # For paper: qty is "spend units" (since we don't have real price)
+    qty = spend
+
+    STATE["cash_usd"] = round(cash - spend, 2)
+    STATE["positions"][mint] = {
+        "qty": qty,
+        "cost_usd": spend,
+        "opened_at": now_ts(),
+        "last_update": now_ts(),
     }
-    state["counters"]["buys"] += 1
-    _trade_log({
-        "ts": _now(),
-        "type": "BUY",
+
+    STATE["trades_count"] += 1
+    STATE["counters"]["buys"] += 1
+    STATE["trades"].append({
+        "ts": now_ts(),
+        "side": "BUY",
         "mint": mint,
-        "usd": spend,
-        "cash_after": state["cash_usd"],
-        "reserve_cash": state["reserve_cash_usd"],
-        "reason": reason,
+        "qty": qty,
+        "cost_usd": spend,
     })
+    clamp_recent(STATE["trades"], 200)
+    return True
 
-def _paper_sell(mint: str, reason: str) -> None:
-    _force_exit_if_needed()
 
-    pos = state["positions"].pop(mint, None)
+def paper_sell(mint: str) -> bool:
+    pos = STATE["positions"].get(mint)
     if not pos:
-        return
+        return False
 
-    invested = float(pos["invested_usd"])
+    cost = float(pos.get("cost_usd", 0.0))
+    qty = float(pos.get("qty", 0.0))
 
-    # For now, we assume break-even on normal sell signal (because we don't have price feed here).
-    # You can later upgrade to compute from on-chain SOL flows or a price API.
-    returned = invested
+    # For now, assume flat exit at cost (breakeven) unless forced exit triggers.
+    proceeds = round(cost, 2)
+    pnl = round(proceeds - cost, 2)
 
-    # Returned funds go to tradable cash
-    state["cash_usd"] = round(float(state["cash_usd"]) + returned, 4)
+    del STATE["positions"][mint]
 
-    state["counters"]["sells"] += 1
-    _trade_log({
-        "ts": _now(),
-        "type": "SELL",
+    if pnl > 0:
+        reserve_add = round(pnl * RESERVE_PCT, 2)
+        cash_add = round(pnl - reserve_add, 2)
+        STATE["reserve_cash_usd"] = round(float(STATE["reserve_cash_usd"]) + reserve_add, 2)
+        STATE["cash_usd"] = round(float(STATE["cash_usd"]) + cost + cash_add, 2)
+    else:
+        STATE["cash_usd"] = round(float(STATE["cash_usd"]) + proceeds, 2)
+
+    STATE["trades_count"] += 1
+    STATE["counters"]["sells"] += 1
+    STATE["trades"].append({
+        "ts": now_ts(),
+        "side": "SELL",
         "mint": mint,
-        "invested_usd": invested,
-        "returned_usd": returned,
-        "cash_after": state["cash_usd"],
-        "reserve_cash": state["reserve_cash_usd"],
-        "reason": reason,
+        "qty": qty,
+        "cost_usd": cost,
+        "proceeds_usd": proceeds,
+        "pnl_usd": pnl,
+        "reason": "signal",
     })
-
-def _extract_signals(payload: Any) -> List[Dict[str, str]]:
-    """
-    Helius "enhanced" webhooks often send a list of tx objects.
-    We look for tokenTransfers where tracked wallet is sender/receiver.
-    BUY signal: toUserAccount is tracked (mint not SOL)
-    SELL signal: fromUserAccount is tracked (mint not SOL)
-    """
-    signals: List[Dict[str, str]] = []
-
-    if not isinstance(payload, list):
-        return signals
-
-    for tx in payload:
-        if not isinstance(tx, dict):
-            continue
-
-        token_transfers = tx.get("tokenTransfers") or []
-        if not isinstance(token_transfers, list):
-            continue
-
-        tx_source = tx.get("source") or ""
-        tx_type = tx.get("type") or ""
-
-        for tt in token_transfers:
-            if not isinstance(tt, dict):
-                continue
-            mint = tt.get("mint") or ""
-            if not mint:
-                continue
-
-            # Ignore SOL mint
-            if mint == "So11111111111111111111111111111111111111112":
-                continue
-
-            to_user = (tt.get("toUserAccount") or "").strip()
-            from_user = (tt.get("fromUserAccount") or "").strip()
-
-            if to_user in TRACKED_WALLETS:
-                signals.append({"side": "BUY", "mint": mint, "why": f"{tx_source}:{tx_type}:to_tracked"})
-            elif from_user in TRACKED_WALLETS:
-                signals.append({"side": "SELL", "mint": mint, "why": f"{tx_source}:{tx_type}:from_tracked"})
-
-    return signals
+    clamp_recent(STATE["trades"], 200)
+    return True
 
 
-# -----------------------------
-# Routes
-# -----------------------------
 @app.get("/health")
 def health():
     return {"ok": True, "service": "sol-paper-bot"}
 
+
 @app.get("/events")
 def events():
-    return {"count": len(state["events"]), "events": state["events"]}
+    return {"count": len(STATE["events"]), "events": STATE["events"]}
+
 
 @app.get("/paper/state")
 def paper_state():
-    _force_exit_if_needed()
+    tracked = get_tracked_wallets()
     return {
-        "cash_usd": state["cash_usd"],
-        "reserve_cash_usd": state["reserve_cash_usd"],
-        "positions": state["positions"],
-        "trades_count": len(state["trades"]),
-        "counters": state["counters"],
-        "started_at": state["started_at"],
+        "cash_usd": STATE["cash_usd"],
+        "reserve_cash_usd": STATE["reserve_cash_usd"],
+        "positions": STATE["positions"],
+        "trades_count": STATE["trades_count"],
+        "counters": STATE["counters"],
+        "started_at": STATE["started_at"],
         "config": {
             "SOL_PRICE_USD": SOL_PRICE_USD,
             "START_CASH_USD": START_CASH_USD,
@@ -301,64 +338,68 @@ def paper_state():
             "TRADABLE_PCT": TRADABLE_PCT,
             "HOLD_MAX_SECONDS": HOLD_MAX_SECONDS,
             "FORCED_EXIT_FALLBACK_MULTI": FORCED_EXIT_FALLBACK_MULTI,
-            "TRACKED_WALLETS_COUNT": len(TRACKED_WALLETS),
+            "TRACKED_WALLETS_COUNT": len(tracked),
         },
-        "recent_trades": state["trades"][-20:],
+        "recent_trades": STATE["trades"][-25:],
     }
 
+
 @app.post("/webhook")
-async def webhook(
-    request: Request,
-    x_webhook_secret: Optional[str] = Header(default=None),
-    authorization: Optional[str] = Header(default=None),
-):
-    # Auth
-    if not _auth_ok(x_webhook_secret, authorization):
-        state["counters"]["webhooks_unauthorized"] += 1
+async def webhook(request: Request):
+    ok, reason = auth_ok(request)
+    if not ok:
+        STATE["counters"]["webhooks_unauthorized"] += 1
+        # IMPORTANT: do not leak secrets
+        # But include safe reason in the response so you can diagnose
+        return JSONResponse({"ok": False, "error": "unauthorized", "detail": reason}, status_code=401)
 
-        # Helpful debug (does NOT reveal secret)
-        # Shows which headers we saw (presence only).
-        return JSONResponse(
-            status_code=401,
-            content={
-                "ok": False,
-                "error": "Unauthorized",
-                "saw_x_webhook_secret": x_webhook_secret is not None,
-                "saw_authorization": authorization is not None,
-            },
-        )
+    # Authorized
+    STATE["counters"]["webhooks_received"] += 1
 
-    state["counters"]["webhooks_received"] += 1
+    # Forced exits happen on any incoming webhook tick
+    forced_exit_if_needed()
 
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        STATE["counters"]["skipped_bad_payload"] += 1
+        return JSONResponse({"ok": False, "error": "bad_json"}, status_code=400)
 
-    # Helius sometimes wraps as {"payload":[...]} or directly [...]
+    # Helius often sends a list; you previously had payload wrapped in [{"..."}]
+    # Your /events screenshot earlier showed: {"payload":[{...}]}
     payload = body.get("payload") if isinstance(body, dict) else body
 
-    signals = _extract_signals(payload)
+    tracked = get_tracked_wallets()
+    swaps = extract_swaps(payload)
 
-    # Store event summary (authorized only)
-    _add_event({
-        "received_at": _now(),
+    # Record a light event summary
+    STATE["events"].append({
+        "received_at": now_ts(),
         "source": "helius",
-        "signals": signals[:10],  # keep it small
+        "swaps_seen": len(swaps),
     })
+    clamp_recent(STATE["events"], 200)
 
-    if not signals:
-        state["counters"]["skipped_no_signal"] += 1
-        _force_exit_if_needed()
-        return {"ok": True, "signals": 0}
+    # Process swaps
+    for tx in swaps:
+        sig = tx.get("signature")
+        info = classify_swap_for_tracked_wallets(tx, tracked)
+        if not info:
+            continue
 
-    # Apply signals
-    for s in signals:
-        side = s["side"]
-        mint = s["mint"]
-        why = s["why"]
+        mint = info["mint"]
+        side = info["side"]
 
         if side == "BUY":
-            _paper_buy(mint, reason=why)
-        elif side == "SELL":
-            _paper_sell(mint, reason=why)
+            # Only open a new position if we don't already have one in that mint
+            if mint not in STATE["positions"]:
+                did = paper_buy(mint)
+                if did:
+                    # Add trace trade info (light)
+                    STATE["events"][-1]["last_trade"] = {"side": "BUY", "mint": mint, "sig": sig}
+        else:
+            did = paper_sell(mint)
+            if did:
+                STATE["events"][-1]["last_trade"] = {"side": "SELL", "mint": mint, "sig": sig}
 
-    _force_exit_if_needed()
-    return {"ok": True, "signals": len(signals)}
+    return {"ok": True}
