@@ -1,201 +1,162 @@
 import os
 import time
-from typing import Any, Dict, List, Optional
+import json
+from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
-app = FastAPI(title="sol-paper-bot")
 
 # ----------------------------
-# Helpers
+# Config helpers
 # ----------------------------
-
-def env_float(name: str, default: float) -> float:
-    v = os.getenv(name)
-    if v is None or str(v).strip() == "":
-        return float(default)
-    return float(v)
-
-def env_int(name: str, default: int) -> int:
-    v = os.getenv(name)
-    if v is None or str(v).strip() == "":
-        return int(default)
-    return int(v)
 
 def env_str(name: str, default: str = "") -> str:
     v = os.getenv(name)
+    return default if v is None else v
+
+def env_float(name: str, default: float) -> float:
+    v = os.getenv(name)
+    try:
+        return float(v) if v is not None and v != "" else default
+    except Exception:
+        return default
+
+def env_int(name: str, default: int) -> int:
+    v = os.getenv(name)
+    try:
+        return int(v) if v is not None and v != "" else default
+    except Exception:
+        return default
+
+def env_bool(name: str, default: bool = False) -> bool:
+    v = os.getenv(name)
     if v is None:
         return default
-    return str(v)
+    return v.strip().lower() in ("1", "true", "yes", "y", "on")
 
-def now_ts() -> int:
-    return int(time.time())
-
-def mask(s: Optional[str]) -> Optional[str]:
-    if not s:
-        return None
-    s = str(s)
-    if len(s) <= 6:
-        return "*" * len(s)
-    return s[:2] + "*" * (len(s) - 4) + s[-2:]
-
-def normalize_auth_value(v: Optional[str]) -> Optional[str]:
-    """Helius sends the configured auth value in the `Authorization` header.
-    Sometimes people use 'Bearer <token>' — we normalize by stripping 'Bearer '.
-    """
-    if not v:
-        return None
-    v = v.strip()
-    if v.lower().startswith("bearer "):
-        v = v[7:].strip()
-    return v
 
 def parse_tracked_wallets(raw: str) -> List[str]:
-    # Accept comma-separated list in one env var, no spaces required.
+    """
+    TRACKED_WALLET can be:
+      - single wallet
+      - comma-separated list
+      - newline-separated list
+      - mixed
+    """
     if not raw:
         return []
-    parts = [p.strip() for p in raw.split(",")]
-    return [p for p in parts if p]
+    # split on commas and newlines
+    parts = []
+    for chunk in raw.replace("\n", ",").split(","):
+        w = chunk.strip()
+        if w:
+            parts.append(w)
+    # de-dup preserving order
+    seen = set()
+    out = []
+    for w in parts:
+        if w not in seen:
+            seen.add(w)
+            out.append(w)
+    return out
+
 
 # ----------------------------
-# Config
+# Bot state (paper trading)
 # ----------------------------
 
-WEBHOOK_SECRET = env_str("WEBHOOK_SECRET", "").strip()
-
-# Wallet list can be a comma-separated list (your 6 wallets in one env var is fine)
-TRACKED_WALLETS_RAW = env_str("TRACKED_WALLET", "")
-TRACKED_WALLETS = parse_tracked_wallets(TRACKED_WALLETS_RAW)
-
-# Paper trading configuration
-SOL_PRICE_USD = env_float("SOL_PRICE_USD", 115.0)          # only used for display/estimates; not required for auth
 START_CASH_USD = env_float("START_CASH_USD", 500.0)
 MAX_BUY_USD = env_float("MAX_BUY_USD", 25.0)
 MIN_CASH_LEFT_USD = env_float("MIN_CASH_LEFT_USD", 100.0)
 
-# 60% reserve / 40% tradable (what you asked for)
 RESERVE_PCT = env_float("RESERVE_PCT", 0.60)
 TRADABLE_PCT = env_float("TRADABLE_PCT", 0.40)
 
-# Forced exit for dead meme coins (seconds)
-HOLD_MAX_SECONDS = env_int("HOLD_MAX_SECONDS", 900)        # 900 = 15 minutes
+HOLD_MAX_SECONDS = env_int("HOLD_MAX_SECONDS", 900)  # 900 = 15 minutes
 FORCED_EXIT_FALLBACK_MULTI = env_float("FORCED_EXIT_FALLBACK_MULTI", 0.50)
 
-DEBUG_WEBHOOK = env_str("DEBUG_WEBHOOK", "false").lower() in ("1", "true", "yes", "y")
+# If you don’t want to guess SOL->USD, you can keep this; it’s only for *paper* math.
+SOL_PRICE_USD = env_float("SOL_PRICE_USD", 115.0)
 
-# ----------------------------
-# In-memory state (paper bot)
-# ----------------------------
+WEBHOOK_SECRET = env_str("WEBHOOK_SECRET", "")
 
-STATE: Dict[str, Any] = {
-    "started_at": now_ts(),
-    "cash_usd": float(START_CASH_USD) * float(TRADABLE_PCT),
-    "reserve_cash_usd": float(START_CASH_USD) * float(RESERVE_PCT),
-    "positions": {},   # token -> { "qty": float, "entry_usd": float, "opened_at": int }
-    "trades_count": 0,
-    "counters": {
-        "webhooks_received": 0,
-        "webhooks_unauthorized": 0,
-        "skipped_no_secret": 0,
-        "skipped_bad_payload": 0,
-        "buys": 0,
-        "sells": 0,
-        "forced_exits": 0,
-        "skipped_low_cash": 0,
-    },
-    "recent_trades": [],
-    "events": [],  # debug/event log
+DEBUG_WEBHOOK = env_bool("DEBUG_WEBHOOK", False)
+
+
+# Paper balances
+reserve_cash_usd = round(START_CASH_USD * RESERVE_PCT, 2)
+cash_usd = round(START_CASH_USD - reserve_cash_usd, 2)
+
+# positions keyed by mint or token id (depends on payload)
+positions: Dict[str, Dict[str, Any]] = {}
+
+# counters + event log
+started_at = int(time.time())
+counters = {
+    "webhooks_received": 0,
+    "webhooks_unauthorized": 0,
+    "skipped_no_secret": 0,
+    "skipped_bad_payload": 0,
+    "buys": 0,
+    "sells": 0,
+    "forced_exits": 0,
+    "skipped_low_cash": 0,
 }
 
-def add_event(kind: str, data: Dict[str, Any]) -> None:
-    evt = {"ts": now_ts(), "kind": kind, **data}
-    STATE["events"].append(evt)
-    # keep last 200 only
-    if len(STATE["events"]) > 200:
-        STATE["events"] = STATE["events"][-200:]
+events: List[Dict[str, Any]] = []
+EVENTS_MAX = 200  # keep last N
 
-def record_trade(action: str, token: str, details: Dict[str, Any]) -> None:
-    STATE["trades_count"] += 1
-    STATE["recent_trades"].append(
-        {"ts": now_ts(), "action": action, "token": token, **details}
-    )
-    if len(STATE["recent_trades"]) > 50:
-        STATE["recent_trades"] = STATE["recent_trades"][-50:]
+last_webhook_debug: Dict[str, Any] = {}
 
-def force_exit_sweep() -> None:
-    """If a position is older than HOLD_MAX_SECONDS, close it using a fallback value."""
-    now = now_ts()
-    to_close = []
-    for token, pos in STATE["positions"].items():
-        opened_at = int(pos.get("opened_at", now))
-        age = now - opened_at
-        if HOLD_MAX_SECONDS > 0 and age >= HOLD_MAX_SECONDS:
-            to_close.append(token)
 
-    for token in to_close:
-        pos = STATE["positions"].get(token)
-        if not pos:
-            continue
-        qty = float(pos.get("qty", 0.0))
-        entry_usd = float(pos.get("entry_usd", 0.0))
+def push_event(e: Dict[str, Any]) -> None:
+    events.append(e)
+    if len(events) > EVENTS_MAX:
+        del events[: len(events) - EVENTS_MAX]
 
-        # fallback exit value (very conservative)
-        exit_usd = max(0.0, entry_usd * float(FORCED_EXIT_FALLBACK_MULTI))
-        proceeds = qty * exit_usd
 
-        STATE["cash_usd"] += proceeds
-        del STATE["positions"][token]
+def mask_secret(s: str) -> str:
+    if not s:
+        return ""
+    if len(s) <= 6:
+        return "*" * len(s)
+    return s[:2] + "*" * (len(s) - 4) + s[-2:]
 
-        STATE["counters"]["forced_exits"] += 1
-        STATE["counters"]["sells"] += 1
-        record_trade("FORCED_EXIT", token, {"qty": qty, "exit_usd": exit_usd, "proceeds_usd": proceeds})
-        add_event("forced_exit", {"token": token, "age_seconds": HOLD_MAX_SECONDS, "exit_usd": exit_usd})
 
-# ----------------------------
-# Auth (THIS is the fix)
-# ----------------------------
+def header_lookup(headers: Dict[str, str], name: str) -> Optional[str]:
+    """
+    Case-insensitive header lookup.
+    """
+    name_l = name.lower()
+    for k, v in headers.items():
+        if k.lower() == name_l:
+            return v
+    return None
 
-def is_authorized(req: Request) -> bool:
-    """Helius sends your configured auth value in the `Authorization` header."""
-    if not WEBHOOK_SECRET:
-        # If you forgot to set WEBHOOK_SECRET, we reject to be safe.
-        return False
 
-    # Primary: Authorization header (Helius)
-    got_auth = normalize_auth_value(req.headers.get("authorization"))
+app = FastAPI()
 
-    # Secondary fallback: x-webhook-secret (if you ever use a sender that sets it)
-    got_x = normalize_auth_value(req.headers.get("x-webhook-secret"))
-
-    expected = normalize_auth_value(WEBHOOK_SECRET)
-
-    return (got_auth == expected) or (got_x == expected)
-
-# ----------------------------
-# Routes
-# ----------------------------
 
 @app.get("/health")
-def health() -> Dict[str, Any]:
+def health():
     return {"ok": True, "service": "sol-paper-bot"}
 
+
 @app.get("/events")
-def events() -> Dict[str, Any]:
-    # Return the event list (debug)
-    return {"count": len(STATE["events"]), "events": STATE["events"]}
+def get_events():
+    return {"count": len(events), "events": events}
+
 
 @app.get("/paper/state")
-def paper_state() -> Dict[str, Any]:
-    # Run forced exit sweep on every state read to keep it simple
-    force_exit_sweep()
+def paper_state():
     return {
-        "cash_usd": round(float(STATE["cash_usd"]), 4),
-        "reserve_cash_usd": round(float(STATE["reserve_cash_usd"]), 4),
-        "positions": STATE["positions"],
-        "trades_count": STATE["trades_count"],
-        "counters": STATE["counters"],
-        "started_at": STATE["started_at"],
+        "cash_usd": cash_usd,
+        "reserve_cash_usd": reserve_cash_usd,
+        "positions": positions,
+        "trades_count": (counters["buys"] + counters["sells"]),
+        "counters": counters,
+        "started_at": started_at,
         "config": {
             "SOL_PRICE_USD": SOL_PRICE_USD,
             "START_CASH_USD": START_CASH_USD,
@@ -205,74 +166,115 @@ def paper_state() -> Dict[str, Any]:
             "TRADABLE_PCT": TRADABLE_PCT,
             "HOLD_MAX_SECONDS": HOLD_MAX_SECONDS,
             "FORCED_EXIT_FALLBACK_MULTI": FORCED_EXIT_FALLBACK_MULTI,
-            "TRACKED_WALLETS_COUNT": len(TRACKED_WALLETS),
+            "TRACKED_WALLETS_COUNT": len(parse_tracked_wallets(env_str("TRACKED_WALLET", ""))),
             "DEBUG_WEBHOOK": DEBUG_WEBHOOK,
         },
     }
 
+
+@app.get("/debug/last")
+def debug_last():
+    if not DEBUG_WEBHOOK:
+        return {"debug": False, "message": "DEBUG_WEBHOOK is not enabled"}
+    return {"debug": True, "last_webhook_debug": last_webhook_debug}
+
+
 @app.post("/webhook")
-async def webhook(req: Request) -> JSONResponse:
-    # Verify auth
-    if not is_authorized(req):
-        STATE["counters"]["webhooks_unauthorized"] += 1
+async def webhook(request: Request):
+    global last_webhook_debug
 
-        # debug why (without leaking secrets)
-        got_auth = req.headers.get("authorization")
-        got_x = req.headers.get("x-webhook-secret")
+    # --- auth: expect header x-webhook-secret to match WEBHOOK_SECRET
+    counters["webhooks_received"] += 1
 
-        if not got_auth and not got_x:
-            STATE["counters"]["skipped_no_secret"] += 1
-            reason = "missing_header"
-        else:
-            reason = "mismatch"
+    if not WEBHOOK_SECRET:
+        counters["skipped_no_secret"] += 1
+        push_event({"ts": int(time.time()), "kind": "webhook_skipped", "reason": "no_server_secret_set"})
+        return JSONResponse({"ok": True}, status_code=200)
 
+    got = header_lookup(dict(request.headers), "x-webhook-secret")
+    if got is None or got != WEBHOOK_SECRET:
+        counters["webhooks_unauthorized"] += 1
+
+        # ultra-safe debug info (no secret leakage)
         if DEBUG_WEBHOOK:
-            add_event(
-                "webhook_unauthorized_debug",
-                {
-                    "reason": reason,
-                    "auth_present": bool(got_auth),
-                    "x_present": bool(got_x),
-                    "got_auth_masked": mask(got_auth),
-                    "got_x_masked": mask(got_x),
-                    "server_secret_masked": mask(WEBHOOK_SECRET),
-                    "headers_keys_sample": sorted(list(req.headers.keys()))[:40],
-                },
-            )
+            last_webhook_debug = {
+                "ts": int(time.time()),
+                "kind": "webhook_unauthorized_debug",
+                "reason": "missing_or_mismatch_header",
+                "header_present": got is not None,
+                "got_len": 0 if got is None else len(got),
+                "server_secret_len": len(WEBHOOK_SECRET),
+                "server_secret_masked": mask_secret(WEBHOOK_SECRET),
+                "got_masked": None if got is None else mask_secret(got),
+                "headers_keys_sample": sorted(list(dict(request.headers).keys()))[:25],
+            }
+            push_event(last_webhook_debug)
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
 
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    # --- read body
+    raw_bytes = await request.body()
 
-    # Authorized: parse JSON (best effort)
-    STATE["counters"]["webhooks_received"] += 1
-    force_exit_sweep()
+    payload: Any = None
+    payload_type = None
+    list_len: Optional[int] = None
+    keys: Optional[List[str]] = None
+    preview: Optional[Dict[str, Any]] = None
 
     try:
-        payload = await req.json()
+        payload = json.loads(raw_bytes.decode("utf-8")) if raw_bytes else None
+        payload_type = type(payload).__name__
     except Exception:
-        STATE["counters"]["skipped_bad_payload"] += 1
-        add_event("webhook_bad_payload", {"note": "request body was not valid JSON"})
-        return JSONResponse({"ok": True, "note": "bad payload (not JSON) accepted"}, status_code=200)
+        counters["skipped_bad_payload"] += 1
+        push_event({"ts": int(time.time()), "kind": "webhook_bad_payload", "reason": "json_decode_failed"})
+        return JSONResponse({"ok": True}, status_code=200)
 
-    # Always log a lightweight event so you can see it working
-    # (don’t store full payload; can be huge)
-    add_event(
-        "webhook_ok",
-        {
-            "payload_type": type(payload).__name__,
-            "keys": list(payload.keys())[:30] if isinstance(payload, dict) else None,
-            "tracked_wallets_count": len(TRACKED_WALLETS),
-        },
-    )
+    # --- summarize payload shape (THIS is what we need next)
+    try:
+        if isinstance(payload, list):
+            list_len = len(payload)
+            if list_len > 0 and isinstance(payload[0], dict):
+                keys = sorted(list(payload[0].keys()))
+                # small preview, truncated values to keep it safe/light
+                preview = {}
+                for k in keys[:20]:
+                    v = payload[0].get(k)
+                    # keep preview small
+                    if isinstance(v, (dict, list)):
+                        pv = json.dumps(v)[:300]
+                    else:
+                        pv = str(v)[:300]
+                    preview[k] = pv
+            else:
+                keys = None
+        elif isinstance(payload, dict):
+            keys = sorted(list(payload.keys()))
+            preview = {}
+            for k in keys[:20]:
+                v = payload.get(k)
+                if isinstance(v, (dict, list)):
+                    pv = json.dumps(v)[:300]
+                else:
+                    pv = str(v)[:300]
+                preview[k] = pv
+        else:
+            keys = None
+    except Exception:
+        keys = None
 
-    # Paper-trade logic placeholder:
-    # Your Helius payload schema depends on webhook type (raw vs enhanced).
-    # For now we just confirm receipt. Once auth is fixed and events are flowing,
-    # we can map Helius fields -> BUY/SELL simulation cleanly.
+    event_ok = {
+        "ts": int(time.time()),
+        "kind": "webhook_ok",
+        "payload_type": payload_type,
+        "list_len": list_len,
+        "keys": keys,
+        "preview": preview,
+        "tracked_wallets_count": len(parse_tracked_wallets(env_str("TRACKED_WALLET", ""))),
+    }
+    push_event(event_ok)
+
+    if DEBUG_WEBHOOK:
+        last_webhook_debug = event_ok
+
+    # --- TODO: trading logic goes here once we see real fields from Helius
+    # For now, just ack.
     return JSONResponse({"ok": True}, status_code=200)
-
-@app.get("/")
-def root() -> Dict[str, Any]:
-    # Optional: stop Render/visitors from seeing 404s at /
-    return {"ok": True, "service": "sol-paper-bot", "endpoints": ["/health", "/paper/state", "/events", "/webhook"]}
-
-# The app object is `app` for: uvicorn app:app
