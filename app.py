@@ -1,82 +1,47 @@
 import os
+import json
 import time
-import hmac
-from typing import Any, Dict, List, Optional, Union, Set, Tuple
+import threading
+from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 
-app = FastAPI()
-
-# -------------------------
-# Env helpers
-# -------------------------
-def env_str(name: str, default: str = "") -> str:
-    v = os.getenv(name)
-    return default if v is None else str(v)
-
+# -----------------------------
+# Config helpers
+# -----------------------------
 def env_float(name: str, default: float) -> float:
     v = os.getenv(name)
     if v is None or v == "":
-        return float(default)
+        return default
     try:
         return float(v)
     except Exception:
-        return float(default)
+        return default
 
 def env_int(name: str, default: int) -> int:
     v = os.getenv(name)
     if v is None or v == "":
-        return int(default)
-    try:
-        return int(v)
-    except Exception:
-        return int(default)
-
-def env_bool(name: str, default: bool = False) -> bool:
-    v = os.getenv(name)
-    if v is None or v == "":
         return default
-    return v.strip().lower() in ("1", "true", "yes", "y", "on")
+    try:
+        return int(float(v))
+    except Exception:
+        return default
 
-# -------------------------
-# Config
-# -------------------------
-DEBUG_WEBHOOK = env_bool("DEBUG_WEBHOOK", True)
+def env_str(name: str, default: str = "") -> str:
+    v = os.getenv(name)
+    return default if v is None else v
 
-WEBHOOK_SECRET = env_str("WEBHOOK_SECRET", "")
-WEBHOOK_PATH_TOKEN = env_str("WEBHOOK_PATH_TOKEN", "")
+def now_ts() -> int:
+    return int(time.time())
 
-START_CASH_USD = env_float("START_CASH_USD", 500.0)
-MIN_CASH_LEFT_USD = env_float("MIN_CASH_LEFT_USD", 100.0)
-MAX_BUY_USD = env_float("MAX_BUY_USD", 25.0)
-
-SOL_PRICE_USD = env_float("SOL_PRICE_USD", 100.0)
-
-RESERVE_PCT = env_float("RESERVE_PCT", 0.6)
-TRADABLE_PCT = env_float("TRADABLE_PCT", 0.4)
-
-HOLD_MAX_SECONDS = env_int("HOLD_MAX_SECONDS", 900)
-FORCED_EXIT_FALLBACK_MULTI = env_float("FORCED_EXIT_FALLBACK_MULTI", 0.5)
-
-# TRACKED_WALLETS: comma-separated list
-TRACKED_WALLETS_RAW = env_str("TRACKED_WALLETS", "").strip()
-TRACKED_WALLETS: List[str] = []
-if TRACKED_WALLETS_RAW:
-    TRACKED_WALLETS = [w.strip() for w in TRACKED_WALLETS_RAW.split(",") if w.strip()]
-
-TRACKED_SET: Set[str] = set(TRACKED_WALLETS)
-
-# -------------------------
-# State + event log
-# -------------------------
-EVENTS: List[Dict[str, Any]] = []
-MAX_EVENTS = 500
-
-state: Dict[str, Any] = {
-    "cash_usd": float(START_CASH_USD * TRADABLE_PCT),
-    "reserve_cash_usd": float(START_CASH_USD * RESERVE_PCT),
-    "positions": {},  # symbol -> dict
+# -----------------------------
+# State + persistence
+# -----------------------------
+DEFAULT_STATE = {
+    "cash_usd": 800.0,
+    "reserve_cash_usd": 0.0,
+    "positions": {},  # symbol -> position dict
     "trades_count": 0,
     "counters": {
         "webhooks_received": 0,
@@ -85,272 +50,481 @@ state: Dict[str, Any] = {
         "skipped_bad_payload": 0,
         "skipped_bad_path": 0,
         "skipped_low_cash": 0,
+        "skipped_no_trade_extract": 0,
         "buys": 0,
         "sells": 0,
         "forced_exits": 0,
     },
-    "started_at": int(time.time()),
+    "started_at": now_ts(),
+    "recent_trades": [],
 }
 
-def push_event(e: Dict[str, Any]) -> None:
-    EVENTS.append(e)
-    if len(EVENTS) > MAX_EVENTS:
-        del EVENTS[: len(EVENTS) - MAX_EVENTS]
+STATE_LOCK = threading.Lock()
+EVENTS_LOCK = threading.Lock()
+EVENTS: List[Dict[str, Any]] = []
+EVENTS_MAX = 500
 
-def mask_secret(s: Optional[str]) -> Optional[str]:
-    if s is None:
-        return None
-    s = str(s)
-    if len(s) <= 6:
-        return "*" * len(s)
-    return s[:2] + "*" * (len(s) - 4) + s[-2:]
+def log_event(kind: str, **kwargs: Any) -> None:
+    evt = {"ts": now_ts(), "kind": kind, **kwargs}
+    with EVENTS_LOCK:
+        EVENTS.append(evt)
+        if len(EVENTS) > EVENTS_MAX:
+            del EVENTS[: len(EVENTS) - EVENTS_MAX]
 
-def constant_time_equals(a: str, b: str) -> bool:
-    return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
+def state_path() -> str:
+    # Render persistent disk should be mounted to /var/data
+    return env_str("STATE_PATH", "/var/data/state.json")
 
-def extract_secret_from_headers(headers) -> Optional[str]:
+def ensure_state_dir(path: str) -> None:
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+
+def atomic_write_json(path: str, obj: Any) -> None:
+    ensure_state_dir(path)
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, separators=(",", ":"), ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+def load_state() -> Dict[str, Any]:
+    path = state_path()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            s = json.load(f)
+        # merge defaults for missing keys
+        merged = dict(DEFAULT_STATE)
+        merged.update(s if isinstance(s, dict) else {})
+        if "counters" not in merged or not isinstance(merged["counters"], dict):
+            merged["counters"] = dict(DEFAULT_STATE["counters"])
+        else:
+            c = dict(DEFAULT_STATE["counters"])
+            c.update(merged["counters"])
+            merged["counters"] = c
+        if "positions" not in merged or not isinstance(merged["positions"], dict):
+            merged["positions"] = {}
+        if "recent_trades" not in merged or not isinstance(merged["recent_trades"], list):
+            merged["recent_trades"] = []
+        return merged
+    except FileNotFoundError:
+        s = dict(DEFAULT_STATE)
+        # initialize cash from env on first boot
+        s["cash_usd"] = env_float("START_CASH_USD", s["cash_usd"])
+        s["reserve_cash_usd"] = 0.0
+        return s
+    except Exception:
+        # if corrupted, fall back safely
+        s = dict(DEFAULT_STATE)
+        s["cash_usd"] = env_float("START_CASH_USD", s["cash_usd"])
+        s["reserve_cash_usd"] = 0.0
+        return s
+
+def save_state(st: Dict[str, Any]) -> None:
+    atomic_write_json(state_path(), st)
+
+STATE: Dict[str, Any] = load_state()
+
+# -----------------------------
+# Trading / policy
+# -----------------------------
+def cfg_snapshot() -> Dict[str, Any]:
+    return {
+        "SOL_PRICE_USD": env_float("SOL_PRICE_USD", 90.0),
+        "START_CASH_USD": env_float("START_CASH_USD", 800.0),
+        "MAX_BUY_USD": env_float("MAX_BUY_USD", 25.0),
+        "MIN_CASH_LEFT_USD": env_float("MIN_CASH_LEFT_USD", 5.0),
+        "RESERVE_PCT": env_float("RESERVE_PCT", 0.40),   # <-- 40% reserve target
+        "TRADABLE_PCT": env_float("TRADABLE_PCT", 0.60), # optional / informational
+        "HOLD_MAX_SECONDS": env_int("HOLD_MAX_SECONDS", 900),
+        "FORCED_EXIT_FALLBACK_MULTI": env_float("FORCED_EXIT_FALLBACK_MULTI", 0.50),
+        "DEBUG_WEBHOOK": env_str("DEBUG_WEBHOOK", "true").lower() == "true",
+    }
+
+def equity_usd(st: Dict[str, Any], px_usd: float) -> float:
+    eq = float(st.get("cash_usd", 0.0)) + float(st.get("reserve_cash_usd", 0.0))
+    for _, p in st.get("positions", {}).items():
+        qty = float(p.get("qty", 0.0))
+        eq += qty * px_usd
+    return eq
+
+def target_reserve_usd(st: Dict[str, Any], px_usd: float, reserve_pct: float) -> float:
+    eq = equity_usd(st, px_usd)
+    if reserve_pct < 0.0:
+        reserve_pct = 0.0
+    if reserve_pct > 0.95:
+        reserve_pct = 0.95
+    return eq * reserve_pct
+
+def enforce_profit_split(st: Dict[str, Any], px_usd: float, reserve_pct: float) -> None:
     """
-    Handles:
-      - x-webhook-secret: <value>
-      - authorization: <value>
-      - authorization: Bearer <value>
+    Keep reserve around reserve_pct of equity.
+    If reserve is above target, move excess to cash.
+    If reserve is below target and cash is comfortably above MIN_CASH_LEFT, top up reserve.
     """
-    x = headers.get("x-webhook-secret")
-    if x:
-        return x.strip()
+    cfg = cfg_snapshot()
+    min_cash_left = cfg["MIN_CASH_LEFT_USD"]
 
-    auth = headers.get("authorization")
-    if not auth:
-        return None
-    auth = auth.strip()
+    cash = float(st.get("cash_usd", 0.0))
+    reserve = float(st.get("reserve_cash_usd", 0.0))
+    target = target_reserve_usd(st, px_usd, reserve_pct)
 
-    # Common webhook provider behavior:
-    # Authorization: Bearer <token>
-    if auth.lower().startswith("bearer "):
-        return auth.split(" ", 1)[1].strip()
+    # Allow small jitter to avoid constant micro-moves
+    eps = max(1.0, 0.0025 * max(1.0, target))
 
-    return auth
+    # If reserve too high, move excess to cash
+    if reserve > target + eps:
+        move = reserve - target
+        st["reserve_cash_usd"] = reserve - move
+        st["cash_usd"] = cash + move
+        log_event("reserve_to_cash_split", usd=round(move, 6), target_reserve=round(target, 6))
 
-# -------------------------
-# Paper trading primitives
-# -------------------------
-def paper_buy(symbol: str, usd: float, reason: str, meta: Dict[str, Any]) -> bool:
-    usd = float(max(0.0, usd))
-    if usd <= 0:
-        return False
+    # If reserve too low, move from cash -> reserve (but don't starve cash)
+    cash = float(st.get("cash_usd", 0.0))
+    reserve = float(st.get("reserve_cash_usd", 0.0))
+    if reserve + eps < target and cash > (min_cash_left + eps):
+        need = target - reserve
+        can = max(0.0, cash - min_cash_left)
+        move = min(need, can)
+        if move > 0:
+            st["cash_usd"] = cash - move
+            st["reserve_cash_usd"] = reserve + move
+            log_event("cash_to_reserve_split", usd=round(move, 6), target_reserve=round(target, 6))
 
-    # Enforce cash floor
-    if state["cash_usd"] - usd < MIN_CASH_LEFT_USD:
-        state["counters"]["skipped_low_cash"] += 1
-        push_event({"ts": int(time.time()), "kind": "paper_buy_skipped_low_cash", "usd": usd})
-        return False
+def rebalance_reserve_to_cash_if_needed(st: Dict[str, Any]) -> None:
+    """
+    If cash is too low to place a new trade while keeping MIN_CASH_LEFT, pull from reserve.
+    This is the 'rebalance reserve → cash if cash too low' rule.
+    """
+    cfg = cfg_snapshot()
+    cash = float(st.get("cash_usd", 0.0))
+    reserve = float(st.get("reserve_cash_usd", 0.0))
 
-    px = float(SOL_PRICE_USD) if symbol.upper() == "SOL" else 1.0
-    qty = usd / px if px > 0 else 0.0
+    max_buy = cfg["MAX_BUY_USD"]
+    min_left = cfg["MIN_CASH_LEFT_USD"]
+
+    # "ready to trade" threshold: enough for MAX_BUY + MIN_CASH_LEFT
+    want_cash = max_buy + min_left
+    if cash >= want_cash:
+        return
+    need = want_cash - cash
+    move = min(need, reserve)
+    if move > 0:
+        st["cash_usd"] = cash + move
+        st["reserve_cash_usd"] = reserve - move
+        log_event("rebalance_reserve_to_cash", usd=round(move, 6), cash_target=round(want_cash, 6))
+
+def get_or_init_position(st: Dict[str, Any], symbol: str) -> Dict[str, Any]:
+    pos = st["positions"].get(symbol)
+    if not isinstance(pos, dict):
+        pos = {
+            "symbol": symbol,
+            "qty": 0.0,
+            "cost_usd": 0.0,
+            "avg_px": 0.0,
+            "opened_ts": None,
+            "last_buy_ts": None,
+            "peak_px": 0.0,
+        }
+        st["positions"][symbol] = pos
+    return pos
+
+def paper_buy(st: Dict[str, Any], symbol: str, usd: float, px_usd: float, reason: str) -> None:
+    cfg = cfg_snapshot()
+    cash = float(st.get("cash_usd", 0.0))
+    if cash - usd < cfg["MIN_CASH_LEFT_USD"]:
+        st["counters"]["skipped_low_cash"] += 1
+        log_event("paper_buy_skipped_low_cash", usd=usd)
+        return
+
+    qty = usd / px_usd if px_usd > 0 else 0.0
     if qty <= 0:
-        return False
+        st["counters"]["skipped_no_trade_extract"] += 1
+        log_event("paper_buy_skipped_bad_price", px_usd=px_usd)
+        return
 
-    # Mutate state (THIS is what makes cash decrease)
-    state["cash_usd"] = float(state["cash_usd"] - usd)
-    pos = state["positions"].get(symbol, {"qty": 0.0, "avg_px": 0.0, "cost_usd": 0.0})
-    old_qty = float(pos["qty"])
-    old_cost = float(pos["cost_usd"])
-
+    pos = get_or_init_position(st, symbol)
+    old_qty = float(pos.get("qty", 0.0))
+    old_cost = float(pos.get("cost_usd", 0.0))
     new_qty = old_qty + qty
     new_cost = old_cost + usd
-    avg_px = (new_cost / new_qty) if new_qty > 0 else px
+    pos["qty"] = new_qty
+    pos["cost_usd"] = new_cost
+    pos["avg_px"] = (new_cost / new_qty) if new_qty > 0 else 0.0
+    if pos.get("opened_ts") is None:
+        pos["opened_ts"] = now_ts()
+    pos["last_buy_ts"] = now_ts()
+    pos["peak_px"] = max(float(pos.get("peak_px", 0.0)), px_usd)
 
-    pos.update({"qty": new_qty, "avg_px": avg_px, "cost_usd": new_cost, "opened_ts": int(time.time())})
-    state["positions"][symbol] = pos
+    st["cash_usd"] = cash - usd
+    st["trades_count"] += 1
+    st["counters"]["buys"] += 1
+    st["recent_trades"].append({
+        "side": "BUY",
+        "symbol": symbol,
+        "usd": usd,
+        "qty": qty,
+        "price_usd": px_usd,
+        "ts": now_ts(),
+        "reason": reason,
+    })
+    if len(st["recent_trades"]) > 200:
+        st["recent_trades"] = st["recent_trades"][-200:]
 
-    state["counters"]["buys"] += 1
-    state["trades_count"] += 1
+    log_event("paper_buy", symbol=symbol, usd=round(usd, 6), qty=round(qty, 10), price_usd=round(px_usd, 6), reason=reason)
 
-    push_event(
-        {
-            "ts": int(time.time()),
-            "kind": "paper_buy_executed",
-            "symbol": symbol,
-            "usd": usd,
-            "px": px,
-            "qty": qty,
-            "cash_usd_after": state["cash_usd"],
-            "reason": reason,
-            "meta": meta,
-        }
-    )
-    return True
+def paper_sell_all(st: Dict[str, Any], symbol: str, px_usd: float, reason: str) -> None:
+    pos = get_or_init_position(st, symbol)
+    qty = float(pos.get("qty", 0.0))
+    if qty <= 0:
+        return
 
-# -------------------------
-# Webhook matching helpers
-# -------------------------
-def pull_wallet_candidates(tx: Dict[str, Any]) -> Set[str]:
+    proceeds = qty * px_usd
+    cost = float(pos.get("cost_usd", 0.0))
+    pnl = proceeds - cost
+
+    st["cash_usd"] = float(st.get("cash_usd", 0.0)) + proceeds
+    st["trades_count"] += 1
+    st["counters"]["sells"] += 1
+    st["recent_trades"].append({
+        "side": "SELL",
+        "symbol": symbol,
+        "qty": qty,
+        "price_usd": px_usd,
+        "proceeds_usd": proceeds,
+        "pnl_usd": pnl,
+        "ts": now_ts(),
+        "reason": reason,
+    })
+    if len(st["recent_trades"]) > 200:
+        st["recent_trades"] = st["recent_trades"][-200:]
+
+    # reset position
+    pos["qty"] = 0.0
+    pos["cost_usd"] = 0.0
+    pos["avg_px"] = 0.0
+    pos["opened_ts"] = None
+    pos["last_buy_ts"] = None
+    pos["peak_px"] = 0.0
+
+    log_event("paper_sell", symbol=symbol, proceeds_usd=round(proceeds, 6), pnl_usd=round(pnl, 6), reason=reason)
+
+def evaluate_exits(st: Dict[str, Any], px_usd: float) -> None:
     """
-    Extracts likely wallet fields from Helius enhanced payload objects.
-    This isn't perfect, but it reliably catches feePayer + transfer participants.
+    IMPORTANT: This must run BEFORE any buy logic.
+    Currently you were seeing 'stuck not selling' because buy checks were returning early.
     """
-    cands: Set[str] = set()
+    cfg = cfg_snapshot()
+    hold_max = cfg["HOLD_MAX_SECONDS"]
+    fallback_multi = cfg["FORCED_EXIT_FALLBACK_MULTI"]
 
-    for k in ("feePayer", "source", "destination", "owner", "wallet", "account", "authority"):
-        v = tx.get(k)
-        if isinstance(v, str) and v:
-            cands.add(v)
+    positions = st.get("positions", {})
+    for symbol, p in list(positions.items()):
+        if not isinstance(p, dict):
+            continue
+        qty = float(p.get("qty", 0.0))
+        if qty <= 0:
+            continue
+        opened_ts = p.get("opened_ts")
+        if opened_ts is None:
+            continue
 
-    for list_key in ("nativeTransfers", "tokenTransfers"):
-        items = tx.get(list_key)
-        if isinstance(items, list):
-            for it in items:
-                if not isinstance(it, dict):
-                    continue
-                for k in ("fromUserAccount", "toUserAccount", "from", "to", "source", "destination", "owner"):
-                    v = it.get(k)
-                    if isinstance(v, str) and v:
-                        cands.add(v)
+        age = now_ts() - int(opened_ts)
+        if age >= hold_max:
+            st["counters"]["forced_exits"] += 1
+            # Forced exit uses fallback multiplier (simulates worse fill if you want)
+            sell_px = px_usd * fallback_multi
+            log_event("time_exit_triggered", symbol=symbol, age_seconds=age, hold_max=hold_max, sell_px=round(sell_px, 6))
+            paper_sell_all(st, symbol, sell_px, reason="time_exit")
 
-    return cands
+# -----------------------------
+# Webhook parsing (Helius enhanced)
+# -----------------------------
+def normalize_authorization(req: Request) -> str:
+    # Helius "Authentication Header" typically sets Authorization header
+    # We'll check Authorization first, then x-webhook-secret optionally.
+    auth = req.headers.get("authorization") or ""
+    return auth.strip()
 
-def get_sig_and_type(tx: Dict[str, Any]) -> Tuple[str, str]:
-    sig = (
-        tx.get("signature")
-        or tx.get("transactionSignature")
-        or tx.get("txSignature")
-        or ""
-    )
-    t = tx.get("type") or tx.get("transactionType") or ""
-    return str(sig), str(t)
+def is_authorized(req: Request) -> bool:
+    expected = env_str("WEBHOOK_AUTH", "").strip()
+    secret = env_str("WEBHOOK_SECRET", "").strip()
 
-# -------------------------
-# Routes
-# -------------------------
+    if secret:
+        got = (req.headers.get("x-webhook-secret") or "").strip()
+        if got != secret:
+            return False
+        return True
+
+    if not expected:
+        # If you didn't set a secret/token, accept (not recommended)
+        return True
+
+    got = normalize_authorization(req)
+    if got == expected:
+        return True
+    # Also allow "Bearer <expected>" or expected already includes Bearer
+    if got.lower().startswith("bearer ") and got[7:].strip() == expected:
+        return True
+    if expected.lower().startswith("bearer ") and got == expected:
+        return True
+    return False
+
+def extract_swaps(payload: Any) -> List[Dict[str, Any]]:
+    """
+    Helius enhanced webhooks often send a LIST of tx objects.
+    We only keep items that are SWAP.
+    """
+    if isinstance(payload, list):
+        items = payload
+    elif isinstance(payload, dict):
+        # sometimes wrapped
+        items = payload.get("events") or payload.get("data") or payload.get("transactions") or []
+        if not isinstance(items, list):
+            items = []
+    else:
+        return []
+
+    swaps = []
+    for tx in items:
+        if not isinstance(tx, dict):
+            continue
+        # Common fields in Helius enhanced payloads
+        t1 = (tx.get("type") or "").upper()
+        t2 = (tx.get("transactionType") or "").upper()
+        if t1 == "SWAP" or t2 == "SWAP":
+            swaps.append(tx)
+    return swaps
+
+def matches_tracked_wallet(tx: Dict[str, Any], tracked: List[str]) -> bool:
+    """
+    Best-effort matching: try 'feePayer' and/or account keys.
+    """
+    if not tracked:
+        return True
+    fee = (tx.get("feePayer") or tx.get("fee_payer") or "").strip()
+    if fee and fee in tracked:
+        return True
+    # Try accountData array if present
+    ad = tx.get("accountData")
+    if isinstance(ad, list):
+        for a in ad:
+            if isinstance(a, dict) and (a.get("account") in tracked):
+                return True
+    return False
+
+# -----------------------------
+# FastAPI app
+# -----------------------------
+app = FastAPI()
+
 @app.get("/")
 def root():
-    return {"ok": True, "service": "sol-paper-bot"}
-
-@app.get("/health")
-def health():
-    return {"ok": True}
-
-@app.get("/events")
-def events():
-    return {"count": len(EVENTS), "events": EVENTS}
+    return {"ok": True, "service": "sol-paper-bot", "ts": now_ts()}
 
 @app.get("/paper/state")
 def paper_state():
-    cfg = {
-        "SOL_PRICE_USD": SOL_PRICE_USD,
-        "START_CASH_USD": START_CASH_USD,
-        "MAX_BUY_USD": MAX_BUY_USD,
-        "MIN_CASH_LEFT_USD": MIN_CASH_LEFT_USD,
-        "RESERVE_PCT": RESERVE_PCT,
-        "TRADABLE_PCT": TRADABLE_PCT,
-        "HOLD_MAX_SECONDS": HOLD_MAX_SECONDS,
-        "FORCED_EXIT_FALLBACK_MULTI": FORCED_EXIT_FALLBACK_MULTI,
-        "TRACKED_WALLETS_COUNT": len(TRACKED_WALLETS),
-        "DEBUG_WEBHOOK": DEBUG_WEBHOOK,
-        "WEBHOOK_PATH_TOKEN_SET": bool(WEBHOOK_PATH_TOKEN),
-        "WEBHOOK_SECRET_SET": bool(WEBHOOK_SECRET),
-    }
-    return {
-        "cash_usd": state["cash_usd"],
-        "reserve_cash_usd": state["reserve_cash_usd"],
-        "positions": state["positions"],
-        "trades_count": state["trades_count"],
-        "counters": state["counters"],
-        "started_at": state["started_at"],
-        "config": cfg,
-        "recent_trades": [],
-    }
-
-@app.post("/webhook/{token}")
-async def webhook(token: str, req: Request):
-    # 0) Path token gate (stops scanners)
-    if not WEBHOOK_PATH_TOKEN:
-        state["counters"]["skipped_bad_path"] += 1
-        push_event({"ts": int(time.time()), "kind": "server_misconfig", "reason": "WEBHOOK_PATH_TOKEN missing"})
-        return JSONResponse({"error": "WEBHOOK_PATH_TOKEN missing on server"}, status_code=500)
-
-    if token != WEBHOOK_PATH_TOKEN:
-        state["counters"]["skipped_bad_path"] += 1
-        if DEBUG_WEBHOOK:
-            push_event({"ts": int(time.time()), "kind": "bad_path", "got": token})
-        # pretend not found to avoid leaking endpoint
-        return JSONResponse({"error": "not found"}, status_code=404)
-
-    # 1) Secret header check
-    if not WEBHOOK_SECRET:
-        state["counters"]["skipped_no_secret"] += 1
-        push_event({"ts": int(time.time()), "kind": "server_misconfig", "reason": "WEBHOOK_SECRET missing"})
-        return JSONResponse({"error": "WEBHOOK_SECRET missing on server"}, status_code=500)
-
-    got = extract_secret_from_headers(req.headers)
-
-    if (got is None) or (not constant_time_equals(got, WEBHOOK_SECRET)):
-        state["counters"]["webhooks_unauthorized"] += 1
-        if DEBUG_WEBHOOK:
-            push_event(
-                {
-                    "ts": int(time.time()),
-                    "kind": "webhook_unauthorized_debug",
-                    "reason": "missing_or_mismatch_header",
-                    "x_present": req.headers.get("x-webhook-secret") is not None,
-                    "auth_present": req.headers.get("authorization") is not None,
-                    "x_len": len(req.headers.get("x-webhook-secret") or ""),
-                    "auth_len": len(req.headers.get("authorization") or ""),
-                    "server_secret_len": len(WEBHOOK_SECRET),
-                    "server_secret_masked": mask_secret(WEBHOOK_SECRET),
-                    "got_masked": mask_secret(got),
-                }
-            )
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-
-    # 2) Parse payload
-    try:
-        payload: Union[Dict[str, Any], List[Any]] = await req.json()
-    except Exception:
-        state["counters"]["skipped_bad_payload"] += 1
-        push_event({"ts": int(time.time()), "kind": "bad_payload"})
-        return JSONResponse({"ok": False, "error": "bad json"}, status_code=400)
-
-    state["counters"]["webhooks_received"] += 1
-
-    payload_type = "dict" if isinstance(payload, dict) else ("list" if isinstance(payload, list) else str(type(payload)))
-    matched = 0
-
-    # 3) Attempt to simulate buys from matched tracked wallets
-    tx_list: List[Dict[str, Any]] = []
-    if isinstance(payload, list):
-        tx_list = [x for x in payload if isinstance(x, dict)]
-    elif isinstance(payload, dict):
-        # Some providers wrap transactions; try common keys
-        for k in ("transactions", "data", "events"):
-            if isinstance(payload.get(k), list):
-                tx_list = [x for x in payload[k] if isinstance(x, dict)]
-                break
-
-    for tx in tx_list:
-        sig, tx_type = get_sig_and_type(tx)
-        wallet_cands = pull_wallet_candidates(tx)
-        hit = next((w for w in wallet_cands if w in TRACKED_SET), None)
-        if not hit:
-            continue
-
-        matched += 1
-
-        # Simulate a buy (you can later replace this with smarter logic)
-        paper_buy(
-            symbol="SOL",
-            usd=min(float(MAX_BUY_USD), 25.0),
-            reason="matched_helius_event",
-            meta={"wallet": hit, "signature": sig, "type": tx_type},
-        )
-
-    push_event(
-        {
-            "ts": int(time.time()),
-            "kind": "webhook_ok",
-            "payload_type": payload_type,
-            "tracked_wallets_count": len(TRACKED_WALLETS),
-            "matched": matched,
+    cfg = cfg_snapshot()
+    with STATE_LOCK:
+        st = STATE
+        # include config snapshot + some "set" indicators for quick debugging
+        resp = dict(st)
+        resp["config"] = {
+            **cfg,
+            "WEBHOOK_PATH_TOKEN_SET": bool(env_str("WEBHOOK_PATH_TOKEN", "").strip()),
+            "WEBHOOK_AUTH_SET": bool(env_str("WEBHOOK_AUTH", "").strip()),
+            "WEBHOOK_SECRET_SET": bool(env_str("WEBHOOK_SECRET", "").strip()),
         }
-    )
+        return JSONResponse(resp)
+
+@app.get("/paper/events")
+def paper_events():
+    with EVENTS_LOCK:
+        return {"count": len(EVENTS), "events": list(EVENTS)[-EVENTS_MAX:]}
+
+@app.post("/paper/tick")
+def paper_tick():
+    """
+    Manual endpoint to force exit checks + policy enforcement,
+    useful if you want the bot to sell even when webhooks slow down.
+    """
+    cfg = cfg_snapshot()
+    px = cfg["SOL_PRICE_USD"]
+    reserve_pct = cfg["RESERVE_PCT"]
+
+    with STATE_LOCK:
+        st = STATE
+        evaluate_exits(st, px)
+        rebalance_reserve_to_cash_if_needed(st)
+        enforce_profit_split(st, px, reserve_pct)
+        save_state(st)
     return {"ok": True}
+
+@app.post("/webhook/hook_{token}")
+async def helius_webhook(token: str, request: Request):
+    expected_token = env_str("WEBHOOK_PATH_TOKEN", "").strip()
+    if expected_token and token != expected_token:
+        with STATE_LOCK:
+            STATE["counters"]["skipped_bad_path"] += 1
+        log_event("webhook_bad_path", got=token)
+        raise HTTPException(status_code=404, detail="bad path")
+
+    with STATE_LOCK:
+        STATE["counters"]["webhooks_received"] += 1
+
+    if not is_authorized(request):
+        with STATE_LOCK:
+            STATE["counters"]["webhooks_unauthorized"] += 1
+        log_event("webhook_unauthorized")
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+    try:
+        payload = await request.json()
+    except Exception:
+        with STATE_LOCK:
+            STATE["counters"]["skipped_bad_payload"] += 1
+        log_event("webhook_bad_payload")
+        raise HTTPException(status_code=400, detail="bad json")
+
+    cfg = cfg_snapshot()
+    px = cfg["SOL_PRICE_USD"]
+    reserve_pct = cfg["RESERVE_PCT"]
+
+    tracked = [w.strip() for w in env_str("TRACKED_WALLETS", "").split(",") if w.strip()]
+    swaps = extract_swaps(payload)
+
+    # debug logging
+    if cfg["DEBUG_WEBHOOK"]:
+        log_event("webhook_ok", payload_type=("list" if isinstance(payload, list) else "dict"), tracked_wallets_count=len(tracked), swaps=len(swaps))
+
+    # ---- IMPORTANT ORDER ----
+    # 1) Exit checks (SELLS) must happen first so we don't get stuck in buy-skip loops
+    # 2) Rebalance reserve -> cash if needed
+    # 3) Enforce 60/40 policy (reserve_pct=0.40)
+    # 4) Only then attempt buys from matched SWAPs
+    with STATE_LOCK:
+        st = STATE
+
+        evaluate_exits(st, px)
+        rebalance_reserve_to_cash_if_needed(st)
+        enforce_profit_split(st, px, reserve_pct)
+
+        matched = 0
+        for tx in swaps:
+            if not matches_tracked_wallet(tx, tracked):
+                continue
+            matched += 1
+
+            # Paper strategy: buy SOL for MAX_BUY_USD on each matched SWAP
+            usd = cfg["MAX_BUY_USD"]
+            paper_buy(st, "SOL", usd=usd, px_usd=px, reason="matched_helius_swap")
+
+            # After each buy, re-run policies
+            rebalance_reserve_to_cash_if_needed(st)
+            enforce_profit_split(st, px, reserve_pct)
+
+        save_state(st)
+
+    # Return how many swap txs matched tracked wallets
+    return {"ok": True, "matched": matched, "swaps": len(swaps)}
