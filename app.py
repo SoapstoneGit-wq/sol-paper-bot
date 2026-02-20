@@ -2,7 +2,7 @@ import os
 import json
 import time
 import tempfile
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
@@ -48,6 +48,7 @@ def _now_ts() -> int:
 
 STATE_PATH = _env_str("STATE_PATH", "/var/data/state.json")
 
+# Static fallback (used if live price fails / disabled)
 SOL_PRICE_USD = _env_float("SOL_PRICE_USD", 90.0)
 
 START_CASH_USD = _env_float("START_CASH_USD", 800.0)
@@ -55,8 +56,6 @@ MAX_BUY_USD = _env_float("MAX_BUY_USD", 25.0)
 MIN_CASH_LEFT_USD = _env_float("MIN_CASH_LEFT_USD", 5.0)
 
 # Profit policy targets (equity split):
-# Reserve target = RESERVE_PCT of equity
-# Cash target    = TRADABLE_PCT of equity
 RESERVE_PCT = _env_float("RESERVE_PCT", 0.40)
 TRADABLE_PCT = _env_float("TRADABLE_PCT", 0.60)
 
@@ -73,6 +72,251 @@ WEBHOOK_SECRET = _env_str("WEBHOOK_SECRET", "").strip()
 # Wallet filter
 TRACKED_WALLETS_RAW = _env_str("TRACKED_WALLETS", "")
 TRACKED_WALLETS = [w.strip() for w in TRACKED_WALLETS_RAW.split(",") if w.strip()]
+
+# ----------------------------
+# Live SOL Price via Pyth Hermes (Option B)
+# ----------------------------
+# You will set these env vars in Render:
+#
+# PRICE_SOURCE=pyth
+# PYTH_SOL_PRICE_ID=<feed id for SOL/USD>
+#
+# Optional:
+# PYTH_HERMES_BASE_URL=https://hermes.pyth.network
+# PRICE_REFRESH_SECONDS=5
+# PRICE_MAX_STALENESS_SECONDS=60
+#
+# Notes:
+# - We try a couple Hermes JSON endpoints because Hermes has multiple routes depending on version.
+# - If it fails, we fall back to SOL_PRICE_USD (static).
+#
+PRICE_SOURCE = _env_str("PRICE_SOURCE", "static").strip().lower()  # "static" or "pyth"
+PYTH_HERMES_BASE_URL = _env_str("PYTH_HERMES_BASE_URL", "https://hermes.pyth.network").strip().rstrip("/")
+PYTH_SOL_PRICE_ID = _env_str("PYTH_SOL_PRICE_ID", "").strip()
+PRICE_REFRESH_SECONDS = _env_int("PRICE_REFRESH_SECONDS", 5)
+PRICE_MAX_STALENESS_SECONDS = _env_int("PRICE_MAX_STALENESS_SECONDS", 60)
+
+# Tiny in-memory cache
+_PRICE_CACHE: Dict[str, Any] = {
+    "ts_fetched": 0,
+    "price": None,        # float
+    "conf": None,         # float
+    "publish_time": None, # int epoch
+    "source": "static",
+    "error": None,
+}
+
+def _http_get_json(url: str, timeout_s: float = 3.0) -> Any:
+    """
+    Avoids adding new deps. Uses stdlib urllib.
+    """
+    import urllib.request
+    import urllib.error
+
+    req = urllib.request.Request(
+        url,
+        headers={
+            "accept": "application/json",
+            "user-agent": "sol-paper-bot/pyth-hermes",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            raw = resp.read()
+        return json.loads(raw.decode("utf-8"))
+    except Exception as e:
+        raise RuntimeError(str(e))
+
+def _parse_pyth_price_obj(obj: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], Optional[int]]:
+    """
+    Hermes responses vary. We try to extract:
+      price (float), conf (float), publish_time (int epoch)
+    """
+    if not isinstance(obj, dict):
+        return None, None, None
+
+    # Common nesting patterns:
+    # - {"price": {"price": "123.45", "conf": "0.12", "publish_time": 123456}}
+    # - {"price": {"price": 12345, "expo": -2, "conf": 12, "publish_time": 123456}}
+    price_node = obj.get("price") if isinstance(obj.get("price"), dict) else obj
+
+    if not isinstance(price_node, dict):
+        return None, None, None
+
+    publish_time = price_node.get("publish_time") or price_node.get("publishTime") or obj.get("publish_time") or obj.get("publishTime")
+    try:
+        publish_time = int(publish_time) if publish_time is not None else None
+    except Exception:
+        publish_time = None
+
+    # If Hermes gives "price" as a string float:
+    if "price" in price_node and isinstance(price_node.get("price"), (str, float, int)) and "expo" not in price_node:
+        try:
+            p = float(price_node.get("price"))
+        except Exception:
+            p = None
+        try:
+            c = float(price_node.get("conf")) if price_node.get("conf") is not None else None
+        except Exception:
+            c = None
+        return p, c, publish_time
+
+    # If Hermes gives price as integer + expo (pyth style):
+    if "price" in price_node and "expo" in price_node:
+        try:
+            p_i = float(price_node.get("price"))
+            expo = int(price_node.get("expo"))
+            p = p_i * (10 ** expo)
+        except Exception:
+            p = None
+        try:
+            c_i = float(price_node.get("conf")) if price_node.get("conf") is not None else None
+            expo = int(price_node.get("expo"))
+            c = (c_i * (10 ** expo)) if c_i is not None else None
+        except Exception:
+            c = None
+        return p, c, publish_time
+
+    return None, None, publish_time
+
+def fetch_pyth_sol_price() -> Tuple[Optional[float], Optional[str]]:
+    """
+    Tries a few Hermes endpoints that commonly exist.
+    Returns (price, error_message)
+    """
+    if not PYTH_SOL_PRICE_ID:
+        return None, "PYTH_SOL_PRICE_ID not set"
+
+    # Try endpoints (Hermes has different routes depending on version/deploy)
+    candidates = [
+        f"{PYTH_HERMES_BASE_URL}/v2/price_feeds?ids[]={PYTH_SOL_PRICE_ID}",
+        f"{PYTH_HERMES_BASE_URL}/v2/price_feeds?ids={PYTH_SOL_PRICE_ID}",
+        f"{PYTH_HERMES_BASE_URL}/api/latest_price_feeds?ids[]={PYTH_SOL_PRICE_ID}",
+        f"{PYTH_HERMES_BASE_URL}/api/latest_price_feeds?ids={PYTH_SOL_PRICE_ID}",
+    ]
+
+    last_err = None
+    for url in candidates:
+        try:
+            data = _http_get_json(url, timeout_s=3.0)
+
+            # Possible shapes:
+            # 1) {"price_feeds":[{...}]}
+            # 2) [{...}]
+            # 3) {"data":[{...}]}
+            # 4) {"parsed":[{...}]}
+            feeds = None
+            if isinstance(data, dict):
+                for k in ("price_feeds", "data", "parsed", "result"):
+                    if isinstance(data.get(k), list):
+                        feeds = data.get(k)
+                        break
+            elif isinstance(data, list):
+                feeds = data
+
+            if not feeds or not isinstance(feeds, list):
+                last_err = f"unexpected response shape from {url}"
+                continue
+
+            feed0 = feeds[0] if feeds else None
+            if not isinstance(feed0, dict):
+                last_err = f"unexpected feed item from {url}"
+                continue
+
+            # Sometimes the feed object contains id + price object
+            # Sometimes it IS the price object
+            p, conf, pub = _parse_pyth_price_obj(feed0)
+            if p is None:
+                # Try nested known key
+                if isinstance(feed0.get("price"), dict):
+                    p, conf, pub = _parse_pyth_price_obj(feed0.get("price"))
+            if p is None:
+                last_err = f"could not parse price from {url}"
+                continue
+
+            # staleness check
+            now = _now_ts()
+            if pub is not None and (now - int(pub)) > PRICE_MAX_STALENESS_SECONDS:
+                last_err = f"stale price (publish_time too old) from {url}"
+                continue
+
+            # Success: update cache fields we can
+            _PRICE_CACHE["conf"] = conf
+            _PRICE_CACHE["publish_time"] = pub
+            return float(p), None
+
+        except Exception as e:
+            last_err = f"{url}: {str(e)}"
+            continue
+
+    return None, last_err or "unknown error"
+
+def get_sol_price_usd() -> Tuple[float, Dict[str, Any]]:
+    """
+    Returns (price, meta)
+    meta includes source + errors.
+    """
+    now = _now_ts()
+
+    # If not using live price, return static
+    if PRICE_SOURCE != "pyth":
+        meta = {
+            "source": "static",
+            "price": float(SOL_PRICE_USD),
+            "conf": None,
+            "publish_time": None,
+            "error": None,
+            "ts_fetched": None,
+        }
+        return float(SOL_PRICE_USD), meta
+
+    # Cache check
+    ts_fetched = int(_PRICE_CACHE.get("ts_fetched") or 0)
+    cached_price = _PRICE_CACHE.get("price")
+    if cached_price is not None and (now - ts_fetched) < max(1, PRICE_REFRESH_SECONDS):
+        meta = {
+            "source": _PRICE_CACHE.get("source") or "pyth",
+            "price": float(cached_price),
+            "conf": _PRICE_CACHE.get("conf"),
+            "publish_time": _PRICE_CACHE.get("publish_time"),
+            "error": _PRICE_CACHE.get("error"),
+            "ts_fetched": ts_fetched,
+        }
+        return float(cached_price), meta
+
+    # Fetch fresh
+    p, err = fetch_pyth_sol_price()
+    if p is not None:
+        _PRICE_CACHE["ts_fetched"] = now
+        _PRICE_CACHE["price"] = float(p)
+        _PRICE_CACHE["source"] = "pyth"
+        _PRICE_CACHE["error"] = None
+        meta = {
+            "source": "pyth",
+            "price": float(p),
+            "conf": _PRICE_CACHE.get("conf"),
+            "publish_time": _PRICE_CACHE.get("publish_time"),
+            "error": None,
+            "ts_fetched": now,
+        }
+        return float(p), meta
+
+    # If Pyth fails, fall back to static
+    _PRICE_CACHE["ts_fetched"] = now
+    _PRICE_CACHE["price"] = float(SOL_PRICE_USD)
+    _PRICE_CACHE["source"] = "static_fallback"
+    _PRICE_CACHE["error"] = err
+
+    meta = {
+        "source": "static_fallback",
+        "price": float(SOL_PRICE_USD),
+        "conf": None,
+        "publish_time": None,
+        "error": err,
+        "ts_fetched": now,
+    }
+    return float(SOL_PRICE_USD), meta
 
 # ----------------------------
 # State persistence
@@ -122,7 +366,6 @@ def load_state() -> Dict[str, Any]:
                         data["counters"][ck] = cv
             return data
     except Exception:
-        # If corrupted, fall back to fresh
         return base
 
     return base
@@ -138,7 +381,7 @@ def save_state() -> None:
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(STATE, f, ensure_ascii=False)
-            os.replace(tmp_path, STATE_PATH)  # atomic
+            os.replace(tmp_path, STATE_PATH)
         finally:
             if os.path.exists(tmp_path):
                 try:
@@ -146,13 +389,11 @@ def save_state() -> None:
                 except Exception:
                     pass
     except Exception:
-        # If saving fails, we still keep running.
         pass
 
 def log_event(kind: str, **fields: Any) -> None:
     evt = {"ts": _now_ts(), "kind": kind, **fields}
     EVENTS.append(evt)
-    # keep last 5000 events in memory
     if len(EVENTS) > 5000:
         del EVENTS[: len(EVENTS) - 5000]
 
@@ -166,34 +407,27 @@ def push_recent_trade(rec: Dict[str, Any]) -> None:
 # ----------------------------
 
 def equity_usd() -> float:
-    # In this simple paper bot, positions are valued using SOL_PRICE_USD if symbol == SOL.
-    # You can extend this later per-mint pricing.
     eq = float(STATE.get("cash_usd", 0.0)) + float(STATE.get("reserve_cash_usd", 0.0))
     positions = STATE.get("positions", {}) or {}
+
+    live_px, _meta = get_sol_price_usd()
+
     for sym, p in positions.items():
         qty = float(p.get("qty", 0.0) or 0.0)
         if qty <= 0:
             continue
         px = float(p.get("mark_px", 0.0) or 0.0)
         if px <= 0:
-            # fallback
-            px = SOL_PRICE_USD if sym == "SOL" else float(p.get("avg_px", 0.0) or 0.0)
+            px = live_px if sym == "SOL" else float(p.get("avg_px", 0.0) or 0.0)
         eq += qty * px
     return float(eq)
 
 def rebalance_targets() -> None:
-    """
-    Keeps reserve and cash aligned to the equity split:
-      reserve target = RESERVE_PCT of equity
-      cash target    = TRADABLE_PCT of equity
-    This does NOT sell positions; it only moves between cash and reserve.
-    """
     eq = equity_usd()
     target_reserve = max(0.0, eq * float(RESERVE_PCT))
     cash = float(STATE.get("cash_usd", 0.0))
     reserve = float(STATE.get("reserve_cash_usd", 0.0))
 
-    # If reserve too big, move excess to cash (common after profitable sells)
     if reserve > target_reserve + 1e-9:
         move = reserve - target_reserve
         STATE["reserve_cash_usd"] = reserve - move
@@ -202,10 +436,8 @@ def rebalance_targets() -> None:
         log_event("rebalance_reserve_to_cash_target", move=round(move, 6), target_reserve=round(target_reserve, 6))
         return
 
-    # If reserve too small, optionally move from cash to reserve (but don't starve buys)
     if reserve + 1e-9 < target_reserve:
         needed = target_reserve - reserve
-        # leave buy headroom
         min_cash_floor = max(MIN_CASH_LEFT_USD, (MAX_BUY_USD + MIN_CASH_LEFT_USD))
         available = max(0.0, cash - min_cash_floor)
         move = min(needed, available)
@@ -216,9 +448,6 @@ def rebalance_targets() -> None:
             log_event("rebalance_cash_to_reserve_target", move=round(move, 6), target_reserve=round(target_reserve, 6))
 
 def ensure_cash_for_buy(buy_usd: float) -> None:
-    """
-    If cash is too low to execute a buy, pull from reserve first (rebalance reserve -> cash).
-    """
     cash = float(STATE.get("cash_usd", 0.0))
     reserve = float(STATE.get("reserve_cash_usd", 0.0))
 
@@ -245,6 +474,8 @@ def maybe_run_forced_exits() -> None:
     now = _now_ts()
     positions = STATE.get("positions", {}) or {}
 
+    live_px, _meta = get_sol_price_usd()
+
     for sym, p in list(positions.items()):
         qty = float(p.get("qty", 0.0) or 0.0)
         if qty <= 0:
@@ -262,9 +493,13 @@ def maybe_run_forced_exits() -> None:
             continue
 
         sell_px = avg_px * float(FORCED_EXIT_FALLBACK_MULTI)
+
+        # keep mark_px fresh-ish
+        if sym == "SOL":
+            p["mark_px"] = float(live_px)
+
         proceeds = qty * sell_px
 
-        # Close position
         STATE["cash_usd"] = float(STATE.get("cash_usd", 0.0)) + proceeds
         p["qty"] = 0.0
         p["closed_ts"] = now
@@ -285,7 +520,6 @@ def maybe_run_forced_exits() -> None:
             "reason": "time_exit",
         })
 
-    # After sells, push profits into target split
     rebalance_targets()
 
 # ----------------------------
@@ -298,7 +532,6 @@ def is_swap_event(item: Any) -> bool:
     t = str(item.get("type") or item.get("transactionType") or item.get("txType") or "").upper()
     if t:
         return t == "SWAP"
-    # If no explicit type, try heuristic: tokenSwap field exists
     if "tokenSwap" in item:
         return True
     return False
@@ -306,7 +539,6 @@ def is_swap_event(item: Any) -> bool:
 def find_matched_wallet(item: Dict[str, Any]) -> Optional[str]:
     if not TRACKED_WALLETS:
         return None
-    # Cheap + effective for small wallet lists: string search
     s = json.dumps(item, separators=(",", ":"), ensure_ascii=False)
     for w in TRACKED_WALLETS:
         if w and w in s:
@@ -320,7 +552,6 @@ def find_matched_wallet(item: Dict[str, Any]) -> Optional[str]:
 def paper_buy_sol(usd: float, meta: Dict[str, Any]) -> bool:
     usd = float(usd)
 
-    # Pull from reserve if needed
     ensure_cash_for_buy(usd)
 
     cash = float(STATE.get("cash_usd", 0.0))
@@ -329,10 +560,9 @@ def paper_buy_sol(usd: float, meta: Dict[str, Any]) -> bool:
         log_event("paper_buy_skipped_low_cash", usd=usd)
         return False
 
-    px = float(SOL_PRICE_USD)
+    px, px_meta = get_sol_price_usd()
     qty = usd / px if px > 0 else 0.0
 
-    # Basic single-symbol position (SOL)
     pos = STATE.setdefault("positions", {}).setdefault("SOL", {
         "symbol": "SOL",
         "qty": 0.0,
@@ -353,7 +583,7 @@ def paper_buy_sol(usd: float, meta: Dict[str, Any]) -> bool:
     pos["qty"] = new_qty
     pos["cost_usd"] = new_cost
     pos["avg_px"] = new_avg
-    pos["mark_px"] = px
+    pos["mark_px"] = float(px)
     now = _now_ts()
     if not pos.get("opened_ts"):
         pos["opened_ts"] = now
@@ -363,6 +593,10 @@ def paper_buy_sol(usd: float, meta: Dict[str, Any]) -> bool:
     STATE["trades_count"] += 1
     STATE["counters"]["buys"] += 1
 
+    # include price source info in logs so you can confirm it's actually live
+    meta2 = dict(meta or {})
+    meta2["sol_price_meta"] = px_meta
+
     log_event(
         "paper_buy_executed",
         symbol="SOL",
@@ -371,7 +605,7 @@ def paper_buy_sol(usd: float, meta: Dict[str, Any]) -> bool:
         qty=qty,
         cash_usd_after=round(float(STATE["cash_usd"]), 6),
         reason="matched_helius_event",
-        meta=meta
+        meta=meta2
     )
     push_recent_trade({
         "side": "BUY",
@@ -381,10 +615,9 @@ def paper_buy_sol(usd: float, meta: Dict[str, Any]) -> bool:
         "price_usd": px,
         "ts": now,
         "reason": "matched_helius_swap",
-        "meta": meta,
+        "meta": meta2,
     })
 
-    # After buys, enforce target equity split
     rebalance_targets()
     return True
 
@@ -404,14 +637,21 @@ def health():
 
 @app.get("/paper/state")
 def paper_state():
-    # Run forced exits opportunistically
     maybe_run_forced_exits()
-
-    # save state (so refresh persists)
     save_state()
 
+    live_px, live_meta = get_sol_price_usd()
+
     cfg = {
-        "SOL_PRICE_USD": SOL_PRICE_USD,
+        "SOL_PRICE_USD_STATIC_FALLBACK": SOL_PRICE_USD,
+        "PRICE_SOURCE": PRICE_SOURCE,
+        "PYTH_HERMES_BASE_URL": PYTH_HERMES_BASE_URL,
+        "PYTH_SOL_PRICE_ID_SET": bool(PYTH_SOL_PRICE_ID),
+        "PRICE_REFRESH_SECONDS": PRICE_REFRESH_SECONDS,
+        "PRICE_MAX_STALENESS_SECONDS": PRICE_MAX_STALENESS_SECONDS,
+        "LIVE_SOL_PRICE_USD": live_px,
+        "LIVE_SOL_PRICE_META": live_meta,
+
         "START_CASH_USD": START_CASH_USD,
         "MAX_BUY_USD": MAX_BUY_USD,
         "MIN_CASH_LEFT_USD": MIN_CASH_LEFT_USD,
@@ -437,17 +677,12 @@ def paper_events(count: int = 200):
 
 def _is_authorized(req: Request) -> bool:
     if not WEBHOOK_SECRET:
-        # If user didn't set secret, allow but count it.
         STATE["counters"]["skipped_no_secret"] += 1
         return True
 
     auth = (req.headers.get("authorization") or "").strip()
     x_secret = (req.headers.get("x-webhook-secret") or "").strip()
 
-    # Accept:
-    # - Authorization: Bearer <SECRET>
-    # - Authorization: <SECRET>
-    # - X-Webhook-Secret: <SECRET>
     if x_secret and x_secret == WEBHOOK_SECRET:
         return True
     if auth == WEBHOOK_SECRET:
@@ -458,31 +693,24 @@ def _is_authorized(req: Request) -> bool:
     return False
 
 def _token_matches(path_token: str) -> bool:
-    """
-    Supports either exact match or optional hook_ prefix.
-    So if env is 93f2... it will match hook_93f2... and vice versa.
-    """
     if not WEBHOOK_PATH_TOKEN:
         return True
     a = WEBHOOK_PATH_TOKEN.strip()
     b = (path_token or "").strip()
     if a == b:
         return True
-    # normalize optional hook_ prefix
     def norm(x: str) -> str:
         return x[5:] if x.startswith("hook_") else x
     return norm(a) == norm(b)
 
 @app.post("/webhook/{token}")
 async def webhook(token: str, request: Request):
-    # Validate path token
     if not _token_matches(token):
         STATE["counters"]["skipped_bad_path"] += 1
         log_event("webhook_bad_path", got=token)
         save_state()
         raise HTTPException(status_code=404, detail="bad path")
 
-    # Validate secret
     if not _is_authorized(request):
         STATE["counters"]["webhooks_unauthorized"] += 1
         log_event("webhook_unauthorized")
@@ -491,7 +719,6 @@ async def webhook(token: str, request: Request):
 
     STATE["counters"]["webhooks_received"] += 1
 
-    # Parse JSON
     try:
         payload = await request.json()
     except Exception:
@@ -500,7 +727,6 @@ async def webhook(token: str, request: Request):
         save_state()
         raise HTTPException(status_code=400, detail="bad json")
 
-    # Helius can send list of tx objects
     items: List[Dict[str, Any]] = []
     payload_type = "unknown"
     if isinstance(payload, list):
@@ -508,7 +734,6 @@ async def webhook(token: str, request: Request):
         items = [x for x in payload if isinstance(x, dict)]
     elif isinstance(payload, dict):
         payload_type = "dict"
-        # sometimes nested: {"events":[...]}
         if isinstance(payload.get("events"), list):
             items = [x for x in payload["events"] if isinstance(x, dict)]
         else:
@@ -521,11 +746,9 @@ async def webhook(token: str, request: Request):
 
     matched = 0
 
-    # Run exits before processing new buys
     maybe_run_forced_exits()
 
     for item in items:
-        # SWAP-only filter
         if not is_swap_event(item):
             continue
 
@@ -544,12 +767,8 @@ async def webhook(token: str, request: Request):
             "type": "SWAP",
         }
 
-        # Execute one fixed-size buy per matched swap
         paper_buy_sol(MAX_BUY_USD, meta=meta)
 
     log_event("webhook_ok", payload_type=payload_type, tracked_wallets_count=len(TRACKED_WALLETS), matched=matched)
-
-    # Persist after processing
     save_state()
-
     return {"ok": True, "matched": matched}
