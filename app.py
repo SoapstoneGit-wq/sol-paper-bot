@@ -2,7 +2,11 @@ import os
 import json
 import time
 import tempfile
+import threading
 from typing import Any, Dict, List, Optional, Tuple
+
+import urllib.request
+import urllib.error
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
@@ -48,8 +52,19 @@ def _now_ts() -> int:
 
 STATE_PATH = _env_str("STATE_PATH", "/var/data/state.json")
 
-# Static fallback (used if live price fails / disabled)
-SOL_PRICE_USD = _env_float("SOL_PRICE_USD", 90.0)
+# Static fallback if live price fails
+SOL_PRICE_USD_STATIC_FALLBACK = _env_float("SOL_PRICE_USD", 90.0)
+
+# Price source (pyth)
+PRICE_SOURCE = _env_str("PRICE_SOURCE", "pyth").strip().lower()  # "pyth" or "static"
+PYTH_HERMES_BASE_URL = _env_str("PYTH_HERMES_BASE_URL", "https://hermes.pyth.network").strip().rstrip("/")
+PYTH_SOL_PRICE_ID = _env_str(
+    "PYTH_SOL_PRICE_ID",
+    # Default: Pyth SOL/USD price feed id you provided
+    "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d",
+).strip()
+PRICE_REFRESH_SECONDS = _env_int("PRICE_REFRESH_SECONDS", 5)
+PRICE_MAX_STALENESS_SECONDS = _env_int("PRICE_MAX_STALENESS_SECONDS", 60)
 
 START_CASH_USD = _env_float("START_CASH_USD", 800.0)
 MAX_BUY_USD = _env_float("MAX_BUY_USD", 25.0)
@@ -61,6 +76,8 @@ TRADABLE_PCT = _env_float("TRADABLE_PCT", 0.60)
 
 # Safety: time-based exit simulation
 HOLD_MAX_SECONDS = _env_int("HOLD_MAX_SECONDS", 900)
+
+# (no longer used for pricing sells; kept so you can still set it if you want later)
 FORCED_EXIT_FALLBACK_MULTI = _env_float("FORCED_EXIT_FALLBACK_MULTI", 0.50)
 
 DEBUG_WEBHOOK = _env_bool("DEBUG_WEBHOOK", False)
@@ -74,249 +91,142 @@ TRACKED_WALLETS_RAW = _env_str("TRACKED_WALLETS", "")
 TRACKED_WALLETS = [w.strip() for w in TRACKED_WALLETS_RAW.split(",") if w.strip()]
 
 # ----------------------------
-# Live SOL Price via Pyth Hermes (Option B)
+# Live price (Pyth Hermes)
 # ----------------------------
-# You will set these env vars in Render:
-#
-# PRICE_SOURCE=pyth
-# PYTH_SOL_PRICE_ID=<feed id for SOL/USD>
-#
-# Optional:
-# PYTH_HERMES_BASE_URL=https://hermes.pyth.network
-# PRICE_REFRESH_SECONDS=5
-# PRICE_MAX_STALENESS_SECONDS=60
-#
-# Notes:
-# - We try a couple Hermes JSON endpoints because Hermes has multiple routes depending on version.
-# - If it fails, we fall back to SOL_PRICE_USD (static).
-#
-PRICE_SOURCE = _env_str("PRICE_SOURCE", "static").strip().lower()  # "static" or "pyth"
-PYTH_HERMES_BASE_URL = _env_str("PYTH_HERMES_BASE_URL", "https://hermes.pyth.network").strip().rstrip("/")
-PYTH_SOL_PRICE_ID = _env_str("PYTH_SOL_PRICE_ID", "").strip()
-PRICE_REFRESH_SECONDS = _env_int("PRICE_REFRESH_SECONDS", 5)
-PRICE_MAX_STALENESS_SECONDS = _env_int("PRICE_MAX_STALENESS_SECONDS", 60)
 
-# Tiny in-memory cache
-_PRICE_CACHE: Dict[str, Any] = {
-    "ts_fetched": 0,
-    "price": None,        # float
-    "conf": None,         # float
-    "publish_time": None, # int epoch
+_LIVE_PRICE_LOCK = threading.Lock()
+_LIVE_SOL_PRICE_USD: float = SOL_PRICE_USD_STATIC_FALLBACK
+_LIVE_SOL_PRICE_META: Dict[str, Any] = {
     "source": "static",
+    "price": SOL_PRICE_USD_STATIC_FALLBACK,
+    "conf": None,
+    "publish_time": None,
     "error": None,
+    "ts_fetched": _now_ts(),
 }
 
-def _http_get_json(url: str, timeout_s: float = 3.0) -> Any:
-    """
-    Avoids adding new deps. Uses stdlib urllib.
-    """
-    import urllib.request
-    import urllib.error
-
+def _http_get_json(url: str, timeout: int = 5) -> Dict[str, Any]:
     req = urllib.request.Request(
         url,
         headers={
             "accept": "application/json",
-            "user-agent": "sol-paper-bot/pyth-hermes",
+            "user-agent": "sol-paper-bot/1.0",
         },
         method="GET",
     )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-            raw = resp.read()
-        return json.loads(raw.decode("utf-8"))
-    except Exception as e:
-        raise RuntimeError(str(e))
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = resp.read()
+    return json.loads(data.decode("utf-8"))
 
-def _parse_pyth_price_obj(obj: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], Optional[int]]:
+def _fetch_pyth_sol_price() -> Tuple[float, Dict[str, Any]]:
     """
-    Hermes responses vary. We try to extract:
-      price (float), conf (float), publish_time (int epoch)
-    """
-    if not isinstance(obj, dict):
-        return None, None, None
-
-    # Common nesting patterns:
-    # - {"price": {"price": "123.45", "conf": "0.12", "publish_time": 123456}}
-    # - {"price": {"price": 12345, "expo": -2, "conf": 12, "publish_time": 123456}}
-    price_node = obj.get("price") if isinstance(obj.get("price"), dict) else obj
-
-    if not isinstance(price_node, dict):
-        return None, None, None
-
-    publish_time = price_node.get("publish_time") or price_node.get("publishTime") or obj.get("publish_time") or obj.get("publishTime")
-    try:
-        publish_time = int(publish_time) if publish_time is not None else None
-    except Exception:
-        publish_time = None
-
-    # If Hermes gives "price" as a string float:
-    if "price" in price_node and isinstance(price_node.get("price"), (str, float, int)) and "expo" not in price_node:
-        try:
-            p = float(price_node.get("price"))
-        except Exception:
-            p = None
-        try:
-            c = float(price_node.get("conf")) if price_node.get("conf") is not None else None
-        except Exception:
-            c = None
-        return p, c, publish_time
-
-    # If Hermes gives price as integer + expo (pyth style):
-    if "price" in price_node and "expo" in price_node:
-        try:
-            p_i = float(price_node.get("price"))
-            expo = int(price_node.get("expo"))
-            p = p_i * (10 ** expo)
-        except Exception:
-            p = None
-        try:
-            c_i = float(price_node.get("conf")) if price_node.get("conf") is not None else None
-            expo = int(price_node.get("expo"))
-            c = (c_i * (10 ** expo)) if c_i is not None else None
-        except Exception:
-            c = None
-        return p, c, publish_time
-
-    return None, None, publish_time
-
-def fetch_pyth_sol_price() -> Tuple[Optional[float], Optional[str]]:
-    """
-    Tries a few Hermes endpoints that commonly exist.
-    Returns (price, error_message)
+    Hermes endpoint: /v2/updates/price/latest?ids[]=<price_id>
+    Returns:
+      price: float (USD)
+      meta: dict
     """
     if not PYTH_SOL_PRICE_ID:
-        return None, "PYTH_SOL_PRICE_ID not set"
+        raise RuntimeError("PYTH_SOL_PRICE_ID not set")
 
-    # Try endpoints (Hermes has different routes depending on version/deploy)
-    candidates = [
-        f"{PYTH_HERMES_BASE_URL}/v2/price_feeds?ids[]={PYTH_SOL_PRICE_ID}",
-        f"{PYTH_HERMES_BASE_URL}/v2/price_feeds?ids={PYTH_SOL_PRICE_ID}",
-        f"{PYTH_HERMES_BASE_URL}/api/latest_price_feeds?ids[]={PYTH_SOL_PRICE_ID}",
-        f"{PYTH_HERMES_BASE_URL}/api/latest_price_feeds?ids={PYTH_SOL_PRICE_ID}",
-    ]
+    url = f"{PYTH_HERMES_BASE_URL}/v2/updates/price/latest?ids[]={PYTH_SOL_PRICE_ID}"
+    j = _http_get_json(url, timeout=5)
 
-    last_err = None
-    for url in candidates:
-        try:
-            data = _http_get_json(url, timeout_s=3.0)
+    # Hermes returns a list in "parsed" field
+    parsed = j.get("parsed")
+    if not isinstance(parsed, list) or not parsed:
+        raise RuntimeError("Unexpected Hermes response: missing parsed")
 
-            # Possible shapes:
-            # 1) {"price_feeds":[{...}]}
-            # 2) [{...}]
-            # 3) {"data":[{...}]}
-            # 4) {"parsed":[{...}]}
-            feeds = None
-            if isinstance(data, dict):
-                for k in ("price_feeds", "data", "parsed", "result"):
-                    if isinstance(data.get(k), list):
-                        feeds = data.get(k)
-                        break
-            elif isinstance(data, list):
-                feeds = data
+    item = parsed[0]
+    price_obj = item.get("price", {})
+    if not isinstance(price_obj, dict):
+        raise RuntimeError("Unexpected Hermes response: missing price object")
 
-            if not feeds or not isinstance(feeds, list):
-                last_err = f"unexpected response shape from {url}"
-                continue
+    # price is string int, exponent is int
+    price_raw = price_obj.get("price")
+    expo = price_obj.get("expo")
+    conf_raw = price_obj.get("conf")
+    publish_time = price_obj.get("publish_time")
 
-            feed0 = feeds[0] if feeds else None
-            if not isinstance(feed0, dict):
-                last_err = f"unexpected feed item from {url}"
-                continue
+    if price_raw is None or expo is None:
+        raise RuntimeError("Unexpected Hermes response: price/expo missing")
 
-            # Sometimes the feed object contains id + price object
-            # Sometimes it IS the price object
-            p, conf, pub = _parse_pyth_price_obj(feed0)
-            if p is None:
-                # Try nested known key
-                if isinstance(feed0.get("price"), dict):
-                    p, conf, pub = _parse_pyth_price_obj(feed0.get("price"))
-            if p is None:
-                last_err = f"could not parse price from {url}"
-                continue
+    try:
+        # Hermes returns integers as strings
+        pr = int(price_raw)
+        ex = int(expo)
+        conf = int(conf_raw) if conf_raw is not None else None
+        px = float(pr) * (10.0 ** float(ex))
+        conf_px = float(conf) * (10.0 ** float(ex)) if conf is not None else None
+    except Exception as e:
+        raise RuntimeError(f"Failed parsing Hermes price: {e}")
 
-            # staleness check
-            now = _now_ts()
-            if pub is not None and (now - int(pub)) > PRICE_MAX_STALENESS_SECONDS:
-                last_err = f"stale price (publish_time too old) from {url}"
-                continue
+    meta = {
+        "source": "pyth",
+        "price": px,
+        "conf": conf_px,
+        "publish_time": int(publish_time) if publish_time is not None else None,
+        "error": None,
+        "ts_fetched": _now_ts(),
+    }
+    return px, meta
 
-            # Success: update cache fields we can
-            _PRICE_CACHE["conf"] = conf
-            _PRICE_CACHE["publish_time"] = pub
-            return float(p), None
-
-        except Exception as e:
-            last_err = f"{url}: {str(e)}"
-            continue
-
-    return None, last_err or "unknown error"
-
-def get_sol_price_usd() -> Tuple[float, Dict[str, Any]]:
+def get_live_sol_price() -> Tuple[float, Dict[str, Any]]:
     """
-    Returns (price, meta)
-    meta includes source + errors.
+    Returns cached price; refreshes if stale.
     """
-    now = _now_ts()
+    global _LIVE_SOL_PRICE_USD, _LIVE_SOL_PRICE_META
 
-    # If not using live price, return static
     if PRICE_SOURCE != "pyth":
         meta = {
             "source": "static",
-            "price": float(SOL_PRICE_USD),
+            "price": SOL_PRICE_USD_STATIC_FALLBACK,
             "conf": None,
             "publish_time": None,
             "error": None,
-            "ts_fetched": None,
+            "ts_fetched": _now_ts(),
         }
-        return float(SOL_PRICE_USD), meta
+        return SOL_PRICE_USD_STATIC_FALLBACK, meta
 
-    # Cache check
-    ts_fetched = int(_PRICE_CACHE.get("ts_fetched") or 0)
-    cached_price = _PRICE_CACHE.get("price")
-    if cached_price is not None and (now - ts_fetched) < max(1, PRICE_REFRESH_SECONDS):
-        meta = {
-            "source": _PRICE_CACHE.get("source") or "pyth",
-            "price": float(cached_price),
-            "conf": _PRICE_CACHE.get("conf"),
-            "publish_time": _PRICE_CACHE.get("publish_time"),
-            "error": _PRICE_CACHE.get("error"),
-            "ts_fetched": ts_fetched,
-        }
-        return float(cached_price), meta
+    with _LIVE_PRICE_LOCK:
+        now = _now_ts()
+        ts_fetched = int(_LIVE_SOL_PRICE_META.get("ts_fetched") or 0)
+        if now - ts_fetched < max(1, PRICE_REFRESH_SECONDS):
+            return float(_LIVE_SOL_PRICE_USD), dict(_LIVE_SOL_PRICE_META)
 
-    # Fetch fresh
-    p, err = fetch_pyth_sol_price()
-    if p is not None:
-        _PRICE_CACHE["ts_fetched"] = now
-        _PRICE_CACHE["price"] = float(p)
-        _PRICE_CACHE["source"] = "pyth"
-        _PRICE_CACHE["error"] = None
-        meta = {
-            "source": "pyth",
-            "price": float(p),
-            "conf": _PRICE_CACHE.get("conf"),
-            "publish_time": _PRICE_CACHE.get("publish_time"),
-            "error": None,
-            "ts_fetched": now,
-        }
-        return float(p), meta
+        # refresh
+        try:
+            px, meta = _fetch_pyth_sol_price()
+            # staleness check (publish_time)
+            pub = meta.get("publish_time")
+            if isinstance(pub, int) and (now - pub) > PRICE_MAX_STALENESS_SECONDS:
+                meta["error"] = f"stale_price_publish_time age={now - pub}s"
+                # Keep last cached value, don't overwrite with stale
+                return float(_LIVE_SOL_PRICE_USD), dict(_LIVE_SOL_PRICE_META)
 
-    # If Pyth fails, fall back to static
-    _PRICE_CACHE["ts_fetched"] = now
-    _PRICE_CACHE["price"] = float(SOL_PRICE_USD)
-    _PRICE_CACHE["source"] = "static_fallback"
-    _PRICE_CACHE["error"] = err
-
-    meta = {
-        "source": "static_fallback",
-        "price": float(SOL_PRICE_USD),
-        "conf": None,
-        "publish_time": None,
-        "error": err,
-        "ts_fetched": now,
-    }
-    return float(SOL_PRICE_USD), meta
+            _LIVE_SOL_PRICE_USD = float(px)
+            _LIVE_SOL_PRICE_META = dict(meta)
+            return float(_LIVE_SOL_PRICE_USD), dict(_LIVE_SOL_PRICE_META)
+        except Exception as e:
+            # fallback to cached, then static if cached missing
+            err = str(e)
+            _LIVE_SOL_PRICE_META = {
+                "source": "pyth",
+                "price": float(_LIVE_SOL_PRICE_USD),
+                "conf": None,
+                "publish_time": _LIVE_SOL_PRICE_META.get("publish_time"),
+                "error": err,
+                "ts_fetched": _now_ts(),
+            }
+            if float(_LIVE_SOL_PRICE_USD) > 0:
+                return float(_LIVE_SOL_PRICE_USD), dict(_LIVE_SOL_PRICE_META)
+            return SOL_PRICE_USD_STATIC_FALLBACK, {
+                "source": "static_fallback",
+                "price": SOL_PRICE_USD_STATIC_FALLBACK,
+                "conf": None,
+                "publish_time": None,
+                "error": err,
+                "ts_fetched": _now_ts(),
+            }
 
 # ----------------------------
 # State persistence
@@ -353,11 +263,9 @@ def load_state() -> Dict[str, Any]:
         if os.path.exists(STATE_PATH):
             with open(STATE_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            # merge keys conservatively
             for k, v in base.items():
                 if k not in data:
                     data[k] = v
-            # counters merge
             if "counters" not in data or not isinstance(data["counters"], dict):
                 data["counters"] = base["counters"]
             else:
@@ -409,16 +317,13 @@ def push_recent_trade(rec: Dict[str, Any]) -> None:
 def equity_usd() -> float:
     eq = float(STATE.get("cash_usd", 0.0)) + float(STATE.get("reserve_cash_usd", 0.0))
     positions = STATE.get("positions", {}) or {}
-
-    live_px, _meta = get_sol_price_usd()
-
     for sym, p in positions.items():
         qty = float(p.get("qty", 0.0) or 0.0)
         if qty <= 0:
             continue
         px = float(p.get("mark_px", 0.0) or 0.0)
         if px <= 0:
-            px = live_px if sym == "SOL" else float(p.get("avg_px", 0.0) or 0.0)
+            px = float(p.get("avg_px", 0.0) or 0.0)
         eq += qty * px
     return float(eq)
 
@@ -474,7 +379,8 @@ def maybe_run_forced_exits() -> None:
     now = _now_ts()
     positions = STATE.get("positions", {}) or {}
 
-    live_px, _meta = get_sol_price_usd()
+    # refresh mark price once per call for realism
+    live_px, live_meta = get_live_sol_price()
 
     for sym, p in list(positions.items()):
         qty = float(p.get("qty", 0.0) or 0.0)
@@ -488,28 +394,37 @@ def maybe_run_forced_exits() -> None:
         if age < HOLD_MAX_SECONDS:
             continue
 
-        avg_px = float(p.get("avg_px", 0.0) or 0.0)
-        if avg_px <= 0:
-            continue
-
-        sell_px = avg_px * float(FORCED_EXIT_FALLBACK_MULTI)
-
-        # keep mark_px fresh-ish
-        if sym == "SOL":
-            p["mark_px"] = float(live_px)
+        # Sell at current live/mark price (more realistic)
+        sell_px = float(p.get("mark_px", 0.0) or 0.0)
+        if sell_px <= 0:
+            sell_px = float(live_px)
 
         proceeds = qty * sell_px
 
+        # Close position: CREDIT cash
         STATE["cash_usd"] = float(STATE.get("cash_usd", 0.0)) + proceeds
+
+        # IMPORTANT: reset cost basis so next buy doesn't inherit old cost/avg
         p["qty"] = 0.0
+        p["cost_usd"] = 0.0
+        p["avg_px"] = 0.0
         p["closed_ts"] = now
         p["last_sell_ts"] = now
+        p["opened_ts"] = None  # next buy starts a fresh holding window
 
         STATE["trades_count"] += 1
         STATE["counters"]["sells"] += 1
         STATE["counters"]["forced_exits"] += 1
 
-        log_event("paper_sell_forced_exit", symbol=sym, qty=qty, px=sell_px, proceeds_usd=round(proceeds, 6), age_s=age)
+        log_event(
+            "paper_sell_forced_exit",
+            symbol=sym,
+            qty=qty,
+            px=sell_px,
+            proceeds_usd=round(proceeds, 6),
+            age_s=age,
+            price_meta=live_meta,
+        )
         push_recent_trade({
             "side": "SELL",
             "symbol": sym,
@@ -560,7 +475,9 @@ def paper_buy_sol(usd: float, meta: Dict[str, Any]) -> bool:
         log_event("paper_buy_skipped_low_cash", usd=usd)
         return False
 
-    px, px_meta = get_sol_price_usd()
+    px, px_meta = get_live_sol_price()
+    px = float(px) if px and float(px) > 0 else float(SOL_PRICE_USD_STATIC_FALLBACK)
+
     qty = usd / px if px > 0 else 0.0
 
     pos = STATE.setdefault("positions", {}).setdefault("SOL", {
@@ -571,7 +488,20 @@ def paper_buy_sol(usd: float, meta: Dict[str, Any]) -> bool:
         "opened_ts": None,
         "last_buy_ts": None,
         "mark_px": px,
+        "closed_ts": None,
+        "last_sell_ts": None,
     })
+
+    prev_qty = float(pos.get("qty", 0.0) or 0.0)
+
+    # FIX: if position is currently closed (qty==0), reset cost/avg and timestamps
+    if prev_qty <= 0.0:
+        pos["qty"] = 0.0
+        pos["cost_usd"] = 0.0
+        pos["avg_px"] = 0.0
+        pos["opened_ts"] = None
+        pos["closed_ts"] = None
+        pos["last_sell_ts"] = None
 
     prev_qty = float(pos.get("qty", 0.0) or 0.0)
     prev_cost = float(pos.get("cost_usd", 0.0) or 0.0)
@@ -583,7 +513,8 @@ def paper_buy_sol(usd: float, meta: Dict[str, Any]) -> bool:
     pos["qty"] = new_qty
     pos["cost_usd"] = new_cost
     pos["avg_px"] = new_avg
-    pos["mark_px"] = float(px)
+    pos["mark_px"] = px
+
     now = _now_ts()
     if not pos.get("opened_ts"):
         pos["opened_ts"] = now
@@ -593,7 +524,6 @@ def paper_buy_sol(usd: float, meta: Dict[str, Any]) -> bool:
     STATE["trades_count"] += 1
     STATE["counters"]["buys"] += 1
 
-    # include price source info in logs so you can confirm it's actually live
     meta2 = dict(meta or {})
     meta2["sol_price_meta"] = px_meta
 
@@ -607,6 +537,7 @@ def paper_buy_sol(usd: float, meta: Dict[str, Any]) -> bool:
         reason="matched_helius_event",
         meta=meta2
     )
+
     push_recent_trade({
         "side": "BUY",
         "symbol": "SOL",
@@ -640,16 +571,16 @@ def paper_state():
     maybe_run_forced_exits()
     save_state()
 
-    live_px, live_meta = get_sol_price_usd()
+    live_px, live_meta = get_live_sol_price()
 
     cfg = {
-        "SOL_PRICE_USD_STATIC_FALLBACK": SOL_PRICE_USD,
+        "SOL_PRICE_USD_STATIC_FALLBACK": SOL_PRICE_USD_STATIC_FALLBACK,
         "PRICE_SOURCE": PRICE_SOURCE,
         "PYTH_HERMES_BASE_URL": PYTH_HERMES_BASE_URL,
         "PYTH_SOL_PRICE_ID_SET": bool(PYTH_SOL_PRICE_ID),
         "PRICE_REFRESH_SECONDS": PRICE_REFRESH_SECONDS,
         "PRICE_MAX_STALENESS_SECONDS": PRICE_MAX_STALENESS_SECONDS,
-        "LIVE_SOL_PRICE_USD": live_px,
+        "LIVE_SOL_PRICE_USD": float(live_px),
         "LIVE_SOL_PRICE_META": live_meta,
 
         "START_CASH_USD": START_CASH_USD,
@@ -659,6 +590,7 @@ def paper_state():
         "TRADABLE_PCT": TRADABLE_PCT,
         "HOLD_MAX_SECONDS": HOLD_MAX_SECONDS,
         "FORCED_EXIT_FALLBACK_MULTI": FORCED_EXIT_FALLBACK_MULTI,
+
         "TRACKED_WALLETS_COUNT": len(TRACKED_WALLETS),
         "DEBUG_WEBHOOK": DEBUG_WEBHOOK,
         "WEBHOOK_PATH_TOKEN_SET": bool(WEBHOOK_PATH_TOKEN),
@@ -674,6 +606,11 @@ def paper_state():
 def paper_events(count: int = 200):
     count = max(1, min(int(count), 2000))
     return {"count": count, "events": EVENTS[-count:]}
+
+# Convenience alias so /events doesn't 404 (your logs show /events was requested)
+@app.get("/events")
+def events_alias(count: int = 200):
+    return paper_events(count=count)
 
 def _is_authorized(req: Request) -> bool:
     if not WEBHOOK_SECRET:
@@ -770,5 +707,6 @@ async def webhook(token: str, request: Request):
         paper_buy_sol(MAX_BUY_USD, meta=meta)
 
     log_event("webhook_ok", payload_type=payload_type, tracked_wallets_count=len(TRACKED_WALLETS), matched=matched)
+
     save_state()
     return {"ok": True, "matched": matched}
