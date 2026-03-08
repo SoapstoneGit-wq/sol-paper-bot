@@ -11,6 +11,7 @@ import urllib.error
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 
+
 # ----------------------------
 # Config helpers
 # ----------------------------
@@ -18,6 +19,7 @@ from fastapi.responses import JSONResponse
 def _env_str(name: str, default: str = "") -> str:
     v = os.getenv(name)
     return default if v is None else str(v)
+
 
 def _env_float(name: str, default: float) -> float:
     v = os.getenv(name)
@@ -28,6 +30,7 @@ def _env_float(name: str, default: float) -> float:
     except Exception:
         return float(default)
 
+
 def _env_int(name: str, default: int) -> int:
     v = os.getenv(name)
     if v is None or str(v).strip() == "":
@@ -37,14 +40,26 @@ def _env_int(name: str, default: int) -> int:
     except Exception:
         return int(default)
 
+
 def _env_bool(name: str, default: bool) -> bool:
     v = os.getenv(name)
     if v is None or str(v).strip() == "":
         return bool(default)
     return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
 
+
 def _now_ts() -> int:
     return int(time.time())
+
+
+def _safe_float(x: Any) -> float:
+    try:
+        if x is None:
+            return 0.0
+        return float(x)
+    except Exception:
+        return 0.0
+
 
 # ----------------------------
 # Runtime config (Render env vars)
@@ -69,13 +84,34 @@ START_CASH_USD = _env_float("START_CASH_USD", 800.0)
 MAX_BUY_USD = _env_float("MAX_BUY_USD", 25.0)
 MIN_CASH_LEFT_USD = _env_float("MIN_CASH_LEFT_USD", 5.0)
 
-# Profit policy targets (equity split):
+# Reserve / tradable split
 RESERVE_PCT = _env_float("RESERVE_PCT", 0.40)
 TRADABLE_PCT = _env_float("TRADABLE_PCT", 0.60)
 
-# Legacy safety: (kept, but no longer the main exit)
+# Exit stack
+HARD_SL_PCT = _env_float("HARD_SL_PCT", 0.20)                  # 0.20 => -20%
+TP1_PCT = _env_float("TP1_PCT", 0.25)                          # +25%
+TP1_SELL_PCT = _env_float("TP1_SELL_PCT", 0.20)                # sell 20%
+TP2_PCT = _env_float("TP2_PCT", 0.50)                          # +50%
+TP2_SELL_PCT = _env_float("TP2_SELL_PCT", 0.20)                # sell 20%
+TP3_PCT = _env_float("TP3_PCT", 1.00)                          # +100%
+TP3_SELL_PCT = _env_float("TP3_SELL_PCT", 0.20)                # sell 20%
+
+TRAIL_START_AFTER_SECONDS = _env_int("TRAIL_START_AFTER_SECONDS", 90)
+TRAIL_PCT_NORMAL = _env_float("TRAIL_PCT_NORMAL", 0.30)        # 30%
+TRAIL_PCT_TIGHT = _env_float("TRAIL_PCT_TIGHT", 0.20)          # 20%
+TRAIL_PCT_MOON = _env_float("TRAIL_PCT_MOON", 0.40)            # 40%
+MOON_TRIGGER_PCT = _env_float("MOON_TRIGGER_PCT", 1.50)        # +150%
+
+TIME_STOP_SECONDS = _env_int("TIME_STOP_SECONDS", 1800)        # 30 min
+TIME_STOP_MIN_PROFIT_PCT = _env_float("TIME_STOP_MIN_PROFIT_PCT", 0.10)  # +10%
+
+# Legacy compatibility
 HOLD_MAX_SECONDS = _env_int("HOLD_MAX_SECONDS", 900)
 FORCED_EXIT_FALLBACK_MULTI = _env_float("FORCED_EXIT_FALLBACK_MULTI", 0.50)
+
+# Small anti-spam buy upgrade
+BUY_COOLDOWN_SECONDS = _env_int("BUY_COOLDOWN_SECONDS", 15)
 
 DEBUG_WEBHOOK = _env_bool("DEBUG_WEBHOOK", False)
 
@@ -87,30 +123,9 @@ WEBHOOK_SECRET = _env_str("WEBHOOK_SECRET", "").strip()
 TRACKED_WALLETS_RAW = _env_str("TRACKED_WALLETS", "")
 TRACKED_WALLETS = [w.strip() for w in TRACKED_WALLETS_RAW.split(",") if w.strip()]
 
-# wSOL mint (used in many swaps)
+# wSOL mint
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 
-# ----------------------------
-# Exit stack config (NEW)
-# ----------------------------
-HARD_SL_PCT = _env_float("HARD_SL_PCT", 0.20)
-
-TP1_PCT = _env_float("TP1_PCT", 0.25)
-TP1_SELL_PCT = _env_float("TP1_SELL_PCT", 0.20)
-TP2_PCT = _env_float("TP2_PCT", 0.50)
-TP2_SELL_PCT = _env_float("TP2_SELL_PCT", 0.20)
-TP3_PCT = _env_float("TP3_PCT", 1.00)
-TP3_SELL_PCT = _env_float("TP3_SELL_PCT", 0.20)
-
-TRAIL_START_AFTER_SECONDS = _env_int("TRAIL_START_AFTER_SECONDS", 90)
-TRAIL_PCT_NORMAL = _env_float("TRAIL_PCT_NORMAL", 0.30)
-TRAIL_PCT_TIGHT = _env_float("TRAIL_PCT_TIGHT", 0.20)
-TRAIL_PCT_MOON = _env_float("TRAIL_PCT_MOON", 0.40)
-
-TIME_STOP_SECONDS = _env_int("TIME_STOP_SECONDS", 1800)           # 30 min
-TIME_STOP_MIN_PROFIT_PCT = _env_float("TIME_STOP_MIN_PROFIT_PCT", 0.10)
-
-MOON_TRIGGER_PCT = _env_float("MOON_TRIGGER_PCT", 1.50)           # +150%
 
 # ----------------------------
 # Live price (Pyth Hermes)
@@ -127,6 +142,7 @@ _LIVE_SOL_PRICE_META: Dict[str, Any] = {
     "ts_fetched": _now_ts(),
 }
 
+
 def _http_get_json(url: str, timeout: int = 5) -> Dict[str, Any]:
     req = urllib.request.Request(
         url,
@@ -139,6 +155,7 @@ def _http_get_json(url: str, timeout: int = 5) -> Dict[str, Any]:
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         data = resp.read()
     return json.loads(data.decode("utf-8"))
+
 
 def _fetch_pyth_sol_price() -> Tuple[float, Dict[str, Any]]:
     if not PYTH_SOL_PRICE_ID:
@@ -183,6 +200,7 @@ def _fetch_pyth_sol_price() -> Tuple[float, Dict[str, Any]]:
     }
     return px, meta
 
+
 def get_live_sol_price() -> Tuple[float, Dict[str, Any]]:
     global _LIVE_SOL_PRICE_USD, _LIVE_SOL_PRICE_META
 
@@ -225,6 +243,7 @@ def get_live_sol_price() -> Tuple[float, Dict[str, Any]]:
             }
             if float(_LIVE_SOL_PRICE_USD) > 0:
                 return float(_LIVE_SOL_PRICE_USD), dict(_LIVE_SOL_PRICE_META)
+
             return SOL_PRICE_USD_STATIC_FALLBACK, {
                 "source": "static_fallback",
                 "price": SOL_PRICE_USD_STATIC_FALLBACK,
@@ -233,6 +252,7 @@ def get_live_sol_price() -> Tuple[float, Dict[str, Any]]:
                 "error": err,
                 "ts_fetched": _now_ts(),
             }
+
 
 # ----------------------------
 # State persistence
@@ -243,12 +263,14 @@ def _ensure_dir_for_file(path: str) -> None:
     if d and not os.path.exists(d):
         os.makedirs(d, exist_ok=True)
 
+
 def load_state() -> Dict[str, Any]:
     base = {
         "cash_usd": float(START_CASH_USD),
         "reserve_cash_usd": 0.0,
         "positions": {},
         "trades_count": 0,
+        "wallet_last_buy_ts": {},
         "counters": {
             "webhooks_received": 0,
             "webhooks_unauthorized": 0,
@@ -256,11 +278,16 @@ def load_state() -> Dict[str, Any]:
             "skipped_bad_payload": 0,
             "skipped_bad_path": 0,
             "skipped_low_cash": 0,
+            "skipped_buy_cooldown": 0,
             "buys": 0,
             "sells": 0,
             "forced_exits": 0,
             "copy_sells": 0,
             "rebalances": 0,
+            "partial_sells": 0,
+            "hard_stop_sells": 0,
+            "trailing_stop_sells": 0,
+            "time_stop_sells": 0,
         },
         "started_at": _now_ts(),
         "recent_trades": [],
@@ -270,9 +297,11 @@ def load_state() -> Dict[str, Any]:
         if os.path.exists(STATE_PATH):
             with open(STATE_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
+
             for k, v in base.items():
                 if k not in data:
                     data[k] = v
+
             if "counters" not in data or not isinstance(data["counters"], dict):
                 data["counters"] = base["counters"]
             else:
@@ -280,15 +309,8 @@ def load_state() -> Dict[str, Any]:
                     if ck not in data["counters"]:
                         data["counters"][ck] = cv
 
-            # Backfill exit-stack fields if missing
-            pos = (data.get("positions") or {}).get("SOL")
-            if isinstance(pos, dict):
-                pos.setdefault("hwm_px", 0.0)
-                pos.setdefault("trail_stop_px", 0.0)
-                pos.setdefault("tp1_done", False)
-                pos.setdefault("tp2_done", False)
-                pos.setdefault("tp3_done", False)
-                pos.setdefault("moon_mode", False)
+            if "wallet_last_buy_ts" not in data or not isinstance(data["wallet_last_buy_ts"], dict):
+                data["wallet_last_buy_ts"] = {}
 
             return data
     except Exception:
@@ -296,8 +318,10 @@ def load_state() -> Dict[str, Any]:
 
     return base
 
+
 STATE: Dict[str, Any] = load_state()
 EVENTS: List[Dict[str, Any]] = []
+
 
 def save_state() -> None:
     try:
@@ -317,16 +341,19 @@ def save_state() -> None:
     except Exception:
         pass
 
+
 def log_event(kind: str, **fields: Any) -> None:
     evt = {"ts": _now_ts(), "kind": kind, **fields}
     EVENTS.append(evt)
     if len(EVENTS) > 5000:
         del EVENTS[: len(EVENTS) - 5000]
 
+
 def push_recent_trade(rec: Dict[str, Any]) -> None:
     STATE["recent_trades"].append(rec)
     if len(STATE["recent_trades"]) > 200:
         STATE["recent_trades"] = STATE["recent_trades"][-200:]
+
 
 # ----------------------------
 # Profit policy + rebalance logic
@@ -335,7 +362,7 @@ def push_recent_trade(rec: Dict[str, Any]) -> None:
 def equity_usd() -> float:
     eq = float(STATE.get("cash_usd", 0.0)) + float(STATE.get("reserve_cash_usd", 0.0))
     positions = STATE.get("positions", {}) or {}
-    for sym, p in positions.items():
+    for _, p in positions.items():
         qty = float(p.get("qty", 0.0) or 0.0)
         if qty <= 0:
             continue
@@ -344,6 +371,7 @@ def equity_usd() -> float:
             px = float(p.get("avg_px", 0.0) or 0.0)
         eq += qty * px
     return float(eq)
+
 
 def rebalance_targets() -> None:
     eq = equity_usd()
@@ -370,6 +398,7 @@ def rebalance_targets() -> None:
             STATE["counters"]["rebalances"] += 1
             log_event("rebalance_cash_to_reserve_target", move=round(move, 6), target_reserve=round(target_reserve, 6))
 
+
 def ensure_cash_for_buy(buy_usd: float) -> None:
     cash = float(STATE.get("cash_usd", 0.0))
     reserve = float(STATE.get("reserve_cash_usd", 0.0))
@@ -389,38 +418,39 @@ def ensure_cash_for_buy(buy_usd: float) -> None:
         STATE["counters"]["rebalances"] += 1
         log_event("rebalance_reserve_to_cash_low_cash", move=round(move, 6), required=round(required, 6))
 
+
 # ----------------------------
-# SELL / BUY helpers
+# Position / exit helpers
 # ----------------------------
 
-def paper_sell_all_sol(meta: Dict[str, Any], reason: str = "wallet_sell") -> bool:
-    pos = (STATE.get("positions", {}) or {}).get("SOL")
-    if not isinstance(pos, dict):
-        return False
-    qty = float(pos.get("qty", 0.0) or 0.0)
-    if qty <= 0:
-        return False
+def _get_or_create_sol_position(mark_px: float) -> Dict[str, Any]:
+    return STATE.setdefault("positions", {}).setdefault("SOL", {
+        "symbol": "SOL",
+        "qty": 0.0,
+        "cost_usd": 0.0,
+        "avg_px": 0.0,
+        "opened_ts": None,
+        "last_buy_ts": None,
+        "mark_px": mark_px,
+        "closed_ts": None,
+        "last_sell_ts": None,
+        "hwm_px": 0.0,
+        "trail_stop_px": 0.0,
+        "tp1_done": False,
+        "tp2_done": False,
+        "tp3_done": False,
+        "moon_mode": False,
+    })
 
-    live_px, live_meta = get_live_sol_price()
-    sell_px = float(pos.get("mark_px", 0.0) or 0.0)
-    if sell_px <= 0:
-        sell_px = float(live_px)
 
-    proceeds = qty * sell_px
-    now = _now_ts()
-
-    STATE["cash_usd"] = float(STATE.get("cash_usd", 0.0)) + proceeds
-
-    # reset position fully (prevents insane avg_px carryover)
+def _reset_position_after_full_close(pos: Dict[str, Any], close_px: float, now: int) -> None:
     pos["qty"] = 0.0
     pos["cost_usd"] = 0.0
     pos["avg_px"] = 0.0
-    pos["mark_px"] = sell_px
+    pos["mark_px"] = close_px
+    pos["opened_ts"] = None
     pos["closed_ts"] = now
     pos["last_sell_ts"] = now
-    pos["opened_ts"] = None
-
-    # reset exit-stack fields
     pos["hwm_px"] = 0.0
     pos["trail_stop_px"] = 0.0
     pos["tp1_done"] = False
@@ -428,128 +458,114 @@ def paper_sell_all_sol(meta: Dict[str, Any], reason: str = "wallet_sell") -> boo
     pos["tp3_done"] = False
     pos["moon_mode"] = False
 
+
+def _record_sell(reason: str, qty: float, px: float, proceeds: float, meta: Optional[Dict[str, Any]] = None) -> None:
+    now = _now_ts()
+    STATE["cash_usd"] = float(STATE.get("cash_usd", 0.0)) + proceeds
     STATE["trades_count"] += 1
     STATE["counters"]["sells"] += 1
 
-    meta2 = dict(meta or {})
-    meta2["sol_price_meta"] = live_meta
+    if reason == "wallet_sell":
+        STATE["counters"]["copy_sells"] += 1
+    elif reason == "hard_stop":
+        STATE["counters"]["hard_stop_sells"] += 1
+    elif reason == "trailing_stop":
+        STATE["counters"]["trailing_stop_sells"] += 1
+    elif reason == "time_stop":
+        STATE["counters"]["time_stop_sells"] += 1
+    elif reason.startswith("tp"):
+        STATE["counters"]["partial_sells"] += 1
+    elif reason == "forced_exit_legacy":
+        STATE["counters"]["forced_exits"] += 1
 
-    log_event(
-        "paper_sell",
-        symbol="SOL",
-        qty=qty,
-        px=sell_px,
-        proceeds_usd=round(proceeds, 6),
-        reason=reason,
-        meta=meta2,
-    )
     push_recent_trade({
         "side": "SELL",
         "symbol": "SOL",
         "qty": qty,
-        "price_usd": sell_px,
+        "price_usd": px,
         "proceeds_usd": proceeds,
         "ts": now,
         "reason": reason,
-        "meta": meta2,
+        "meta": meta or {},
     })
 
-    rebalance_targets()
-    return True
+    log_event(
+        f"paper_sell_{reason}",
+        symbol="SOL",
+        qty=qty,
+        px=px,
+        proceeds_usd=round(proceeds, 6),
+        meta=meta or {},
+    )
 
-def paper_sell_sol_qty(qty_to_sell: float, meta: Dict[str, Any], reason: str) -> bool:
-    pos = (STATE.get("positions", {}) or {}).get("SOL")
-    if not isinstance(pos, dict):
-        return False
+    rebalance_targets()
+
+
+def _sell_fraction_of_position(pos: Dict[str, Any], fraction: float, reason: str, meta: Optional[Dict[str, Any]] = None) -> bool:
     qty = float(pos.get("qty", 0.0) or 0.0)
     if qty <= 0:
         return False
 
-    qty_to_sell = float(qty_to_sell)
-    if qty_to_sell <= 0:
-        return False
+    live_px, live_meta = get_live_sol_price()
+    px = float(live_px)
+    now = _now_ts()
 
-    sell_qty = min(qty, qty_to_sell)
+    sell_qty = qty * max(0.0, min(1.0, float(fraction)))
     if sell_qty <= 0:
         return False
 
-    live_px, live_meta = get_live_sol_price()
-    sell_px = float(pos.get("mark_px", 0.0) or 0.0)
-    if sell_px <= 0:
-        sell_px = float(live_px)
+    proceeds = sell_qty * px
 
-    proceeds = sell_qty * sell_px
-    now = _now_ts()
+    remaining_qty = qty - sell_qty
+    if remaining_qty <= 1e-12:
+        _record_sell(reason=reason, qty=qty, px=px, proceeds=proceeds, meta={**(meta or {}), "sol_price_meta": live_meta})
+        _reset_position_after_full_close(pos, close_px=px, now=now)
+        return True
 
-    STATE["cash_usd"] = float(STATE.get("cash_usd", 0.0)) + proceeds
+    old_cost = float(pos.get("cost_usd", 0.0) or 0.0)
+    avg_px = float(pos.get("avg_px", 0.0) or 0.0)
+    remaining_cost = max(0.0, old_cost - (sell_qty * avg_px))
 
-    # Reduce position (keep avg_px same; reduce cost_usd proportionally)
-    prev_qty = qty
-    prev_cost = float(pos.get("cost_usd", 0.0) or 0.0)
-
-    new_qty = prev_qty - sell_qty
-    cost_reduction = prev_cost * (sell_qty / prev_qty) if prev_qty > 0 else 0.0
-    new_cost = max(0.0, prev_cost - cost_reduction)
-
-    pos["qty"] = new_qty
-    pos["cost_usd"] = new_cost
-    pos["mark_px"] = sell_px
+    pos["qty"] = remaining_qty
+    pos["cost_usd"] = remaining_cost
+    pos["avg_px"] = (remaining_cost / remaining_qty) if remaining_qty > 0 else 0.0
+    pos["mark_px"] = px
     pos["last_sell_ts"] = now
+    pos["closed_ts"] = None
 
-    if new_qty <= 1e-12:
-        # fully closed
-        pos["qty"] = 0.0
-        pos["cost_usd"] = 0.0
-        pos["avg_px"] = 0.0
-        pos["closed_ts"] = now
-        pos["opened_ts"] = None
-
-        # reset exit-stack fields
-        pos["hwm_px"] = 0.0
-        pos["trail_stop_px"] = 0.0
-        pos["tp1_done"] = False
-        pos["tp2_done"] = False
-        pos["tp3_done"] = False
-        pos["moon_mode"] = False
-
-    STATE["trades_count"] += 1
-    STATE["counters"]["sells"] += 1
-
-    meta2 = dict(meta or {})
-    meta2["sol_price_meta"] = live_meta
-
-    log_event(
-        "paper_sell_partial",
-        symbol="SOL",
-        qty=sell_qty,
-        px=sell_px,
-        proceeds_usd=round(proceeds, 6),
+    _record_sell(
         reason=reason,
-        meta=meta2,
+        qty=sell_qty,
+        px=px,
+        proceeds=proceeds,
+        meta={**(meta or {}), "sol_price_meta": live_meta},
     )
-    push_recent_trade({
-        "side": "SELL",
-        "symbol": "SOL",
-        "qty": sell_qty,
-        "price_usd": sell_px,
-        "proceeds_usd": proceeds,
-        "ts": now,
-        "reason": reason,
-        "meta": meta2,
-    })
-
-    rebalance_targets()
     return True
 
-# ----------------------------
-# Exit stack runner (NEW)
-# ----------------------------
+
+def _sell_all_position(pos: Dict[str, Any], reason: str, meta: Optional[Dict[str, Any]] = None) -> bool:
+    qty = float(pos.get("qty", 0.0) or 0.0)
+    if qty <= 0:
+        return False
+
+    live_px, live_meta = get_live_sol_price()
+    px = float(live_px)
+    proceeds = qty * px
+    now = _now_ts()
+
+    _record_sell(
+        reason=reason,
+        qty=qty,
+        px=px,
+        proceeds=proceeds,
+        meta={**(meta or {}), "sol_price_meta": live_meta},
+    )
+    _reset_position_after_full_close(pos, close_px=px, now=now)
+    return True
+
 
 def maybe_run_exit_stack() -> None:
-    now = _now_ts()
-    positions = STATE.get("positions", {}) or {}
-
-    pos = positions.get("SOL")
+    pos = (STATE.get("positions", {}) or {}).get("SOL")
     if not isinstance(pos, dict):
         return
 
@@ -557,110 +573,129 @@ def maybe_run_exit_stack() -> None:
     if qty <= 0:
         return
 
-    entry = float(pos.get("avg_px", 0.0) or 0.0)
-    if entry <= 0:
+    opened_ts = pos.get("opened_ts")
+    if not opened_ts:
         return
 
-    opened = pos.get("opened_ts")
-    if not opened:
-        return
-
+    now = _now_ts()
     live_px, live_meta = get_live_sol_price()
+    px = float(live_px)
+    pos["mark_px"] = px
 
-    # Current price: use live, and also persist mark_px so exits work between webhooks
-    px = float(live_px) if live_px and float(live_px) > 0 else float(pos.get("mark_px", 0.0) or 0.0)
-    if px <= 0:
-        px = entry
-    pos["mark_px"] = float(px)
+    avg_px = float(pos.get("avg_px", 0.0) or 0.0)
+    if avg_px <= 0:
+        return
 
-    # Backfill fields
-    pos.setdefault("hwm_px", 0.0)
-    pos.setdefault("trail_stop_px", 0.0)
-    pos.setdefault("tp1_done", False)
-    pos.setdefault("tp2_done", False)
-    pos.setdefault("tp3_done", False)
-    pos.setdefault("moon_mode", False)
+    pnl_pct = (px / avg_px) - 1.0
+    age_s = now - int(opened_ts)
 
-    # Update HWM
-    hwm = float(pos.get("hwm_px", 0.0) or 0.0)
-    if hwm <= 0:
-        hwm = entry
-    if px > hwm:
-        hwm = px
-        pos["hwm_px"] = hwm
+    hwm_px = max(float(pos.get("hwm_px", 0.0) or 0.0), px)
+    pos["hwm_px"] = hwm_px
 
-    pnl = (px / entry) - 1.0  # 0.25 == +25%
-    age = now - int(opened)
-
-    # Moon mode trigger
-    if (not bool(pos.get("moon_mode"))) and pnl >= float(MOON_TRIGGER_PCT):
+    if pnl_pct >= MOON_TRIGGER_PCT:
         pos["moon_mode"] = True
-        log_event("moon_mode_on", symbol="SOL", pnl=round(pnl, 6), px=px, entry=entry)
 
     # 1) Hard stop-loss
-    hard_stop_px = entry * (1.0 - float(HARD_SL_PCT))
+    hard_stop_px = avg_px * (1.0 - HARD_SL_PCT)
     if px <= hard_stop_px:
-        meta = {"type": "BOT_EXIT", "reason": "hard_stop", "price_meta": live_meta}
-        if paper_sell_all_sol(meta=meta, reason="hard_stop"):
-            STATE["counters"]["forced_exits"] += 1
+        _sell_all_position(
+            pos,
+            reason="hard_stop",
+            meta={
+                "entry_px": avg_px,
+                "exit_px": px,
+                "pnl_pct": pnl_pct,
+                "hard_stop_px": hard_stop_px,
+                "age_s": age_s,
+                "sol_price_meta": live_meta,
+            },
+        )
         return
 
-    # 2) Partial profit ladder (one per pass)
-    def _sell_pct_of_pos(pct_of_pos: float, why: str) -> None:
-        q = float(pos.get("qty", 0.0) or 0.0)
-        sell_qty = q * float(pct_of_pos)
-        meta = {"type": "BOT_EXIT", "reason": why, "price_meta": live_meta}
-        paper_sell_sol_qty(sell_qty, meta=meta, reason=why)
+    # 2) Partial profit ladder
+    if (not bool(pos.get("tp1_done"))) and pnl_pct >= TP1_PCT:
+        if _sell_fraction_of_position(
+            pos,
+            fraction=TP1_SELL_PCT,
+            reason="tp1_partial",
+            meta={"trigger_pct": TP1_PCT, "pnl_pct": pnl_pct, "age_s": age_s},
+        ):
+            pos["tp1_done"] = True
 
-    if (not bool(pos.get("tp1_done"))) and pnl >= float(TP1_PCT):
-        _sell_pct_of_pos(float(TP1_SELL_PCT), "tp1")
-        pos["tp1_done"] = True
+    if float(pos.get("qty", 0.0) or 0.0) <= 0:
         return
 
-    if (not bool(pos.get("tp2_done"))) and pnl >= float(TP2_PCT):
-        _sell_pct_of_pos(float(TP2_SELL_PCT), "tp2")
-        pos["tp2_done"] = True
+    if (not bool(pos.get("tp2_done"))) and pnl_pct >= TP2_PCT:
+        if _sell_fraction_of_position(
+            pos,
+            fraction=TP2_SELL_PCT,
+            reason="tp2_partial",
+            meta={"trigger_pct": TP2_PCT, "pnl_pct": pnl_pct, "age_s": age_s},
+        ):
+            pos["tp2_done"] = True
+
+    if float(pos.get("qty", 0.0) or 0.0) <= 0:
         return
 
-    if (not bool(pos.get("tp3_done"))) and pnl >= float(TP3_PCT):
-        _sell_pct_of_pos(float(TP3_SELL_PCT), "tp3")
-        pos["tp3_done"] = True
+    if (not bool(pos.get("tp3_done"))) and pnl_pct >= TP3_PCT:
+        if _sell_fraction_of_position(
+            pos,
+            fraction=TP3_SELL_PCT,
+            reason="tp3_partial",
+            meta={"trigger_pct": TP3_PCT, "pnl_pct": pnl_pct, "age_s": age_s},
+        ):
+            pos["tp3_done"] = True
+
+    if float(pos.get("qty", 0.0) or 0.0) <= 0:
         return
 
-    # 3) Trailing stop after first partial + warmup
-    any_partial_done = bool(pos.get("tp1_done")) or bool(pos.get("tp2_done")) or bool(pos.get("tp3_done"))
+    # 3) Time stop
+    if age_s >= TIME_STOP_SECONDS and pnl_pct < TIME_STOP_MIN_PROFIT_PCT:
+        _sell_all_position(
+            pos,
+            reason="time_stop",
+            meta={
+                "pnl_pct": pnl_pct,
+                "age_s": age_s,
+                "threshold_pct": TIME_STOP_MIN_PROFIT_PCT,
+                "sol_price_meta": live_meta,
+            },
+        )
+        return
 
-    if any_partial_done and age >= int(TRAIL_START_AFTER_SECONDS):
-        trail_pct = float(TRAIL_PCT_NORMAL)
-
-        # tighten after +100%
-        if pnl >= 1.0:
-            trail_pct = float(TRAIL_PCT_TIGHT)
-
-        # widen in moon mode
+    # 4) Trailing stop
+    trail_active = age_s >= TRAIL_START_AFTER_SECONDS or bool(pos.get("tp1_done"))
+    if trail_active:
         if bool(pos.get("moon_mode")):
-            trail_pct = float(TRAIL_PCT_MOON)
+            trail_pct = TRAIL_PCT_MOON
+        elif bool(pos.get("tp3_done")) or pnl_pct >= TP3_PCT:
+            trail_pct = TRAIL_PCT_TIGHT
+        else:
+            trail_pct = TRAIL_PCT_NORMAL
 
-        trail_stop = hwm * (1.0 - trail_pct)
+        trail_stop_px = hwm_px * (1.0 - trail_pct)
+        pos["trail_stop_px"] = trail_stop_px
 
-        # only ratchet up
-        prev_trail = float(pos.get("trail_stop_px", 0.0) or 0.0)
-        if trail_stop > prev_trail:
-            pos["trail_stop_px"] = trail_stop
-
-        # trigger
-        if px <= float(pos.get("trail_stop_px", 0.0) or 0.0):
-            meta = {"type": "BOT_EXIT", "reason": "trailing_stop", "price_meta": live_meta}
-            if paper_sell_all_sol(meta=meta, reason="trailing_stop"):
-                STATE["counters"]["forced_exits"] += 1
+        if px <= trail_stop_px:
+            _sell_all_position(
+                pos,
+                reason="trailing_stop",
+                meta={
+                    "pnl_pct": pnl_pct,
+                    "age_s": age_s,
+                    "hwm_px": hwm_px,
+                    "trail_pct": trail_pct,
+                    "trail_stop_px": trail_stop_px,
+                    "sol_price_meta": live_meta,
+                },
+            )
             return
 
-    # 4) Conditional time stop (30m): if not up enough, exit
-    if age >= int(TIME_STOP_SECONDS) and pnl < float(TIME_STOP_MIN_PROFIT_PCT):
-        meta = {"type": "BOT_EXIT", "reason": "time_stop_underperform", "price_meta": live_meta}
-        if paper_sell_all_sol(meta=meta, reason="time_stop_underperform"):
-            STATE["counters"]["forced_exits"] += 1
-        return
+
+def maybe_run_forced_exits() -> None:
+    # Legacy alias so older calls don't break
+    maybe_run_exit_stack()
+
 
 # ----------------------------
 # Webhook parsing helpers (Helius Enhanced)
@@ -676,6 +711,7 @@ def is_swap_event(item: Any) -> bool:
         return True
     return False
 
+
 def find_matched_wallet(item: Dict[str, Any]) -> Optional[str]:
     if not TRACKED_WALLETS:
         return None
@@ -685,27 +721,10 @@ def find_matched_wallet(item: Dict[str, Any]) -> Optional[str]:
             return w
     return None
 
-def _safe_float(x: Any) -> float:
-    try:
-        if x is None:
-            return 0.0
-        return float(x)
-    except Exception:
-        return 0.0
 
 def _detect_wallet_sol_delta(item: Dict[str, Any], wallet: str) -> Tuple[float, Dict[str, Any]]:
-    """
-    Attempts to compute net SOL delta for a given wallet from an enhanced tx object.
-    Returns (delta_sol, debug_meta).
-
-    We look in multiple common fields:
-      - accountData[].nativeBalanceChange  (lamports delta)
-      - nativeTransfers (lamports or SOL amounts)
-      - tokenBalanceChanges for wSOL mint (So111...)
-    """
     dbg: Dict[str, Any] = {"method_hits": [], "delta_native_sol": 0.0, "delta_wsol_sol": 0.0}
 
-    # 1) accountData nativeBalanceChange (lamports)
     acc = item.get("accountData")
     if isinstance(acc, list):
         for a in acc:
@@ -720,7 +739,6 @@ def _detect_wallet_sol_delta(item: Dict[str, Any], wallet: str) -> Tuple[float, 
                 dbg["delta_native_sol"] += d
                 dbg["method_hits"].append("accountData.nativeBalanceChange")
 
-    # 2) nativeTransfers
     nt = item.get("nativeTransfers")
     if isinstance(nt, list):
         for t in nt:
@@ -732,7 +750,7 @@ def _detect_wallet_sol_delta(item: Dict[str, Any], wallet: str) -> Tuple[float, 
             if amt is None:
                 continue
             a = _safe_float(amt)
-            if abs(a) > 1_000_000:  # likely lamports
+            if abs(a) > 1_000_000:
                 a = a / 1_000_000_000.0
             if from_acct == wallet:
                 dbg["delta_native_sol"] -= a
@@ -741,7 +759,6 @@ def _detect_wallet_sol_delta(item: Dict[str, Any], wallet: str) -> Tuple[float, 
                 dbg["delta_native_sol"] += a
                 dbg["method_hits"].append("nativeTransfers")
 
-    # 3) tokenBalanceChanges / tokenTransfers for wSOL
     tbc = item.get("tokenBalanceChanges") or item.get("tokenTransfers") or item.get("tokenBalanceChange")
     if isinstance(tbc, list):
         for ch in tbc:
@@ -792,12 +809,8 @@ def _detect_wallet_sol_delta(item: Dict[str, Any], wallet: str) -> Tuple[float, 
     dbg["delta_total_sol"] = delta
     return delta, dbg
 
+
 def _classify_swap_side_for_wallet(item: Dict[str, Any], wallet: str) -> Tuple[str, Dict[str, Any]]:
-    """
-    Returns ("buy"|"sell"|"unknown", debug_meta)
-    buy  => wallet net SOL increases (native+wSOL)
-    sell => wallet net SOL decreases
-    """
     delta, dbg = _detect_wallet_sol_delta(item, wallet)
     eps = 1e-6
     if delta > eps:
@@ -805,6 +818,7 @@ def _classify_swap_side_for_wallet(item: Dict[str, Any], wallet: str) -> Tuple[s
     if delta < -eps:
         return "sell", dbg
     return "unknown", dbg
+
 
 # ----------------------------
 # Paper trade execution
@@ -823,29 +837,9 @@ def paper_buy_sol(usd: float, meta: Dict[str, Any]) -> bool:
 
     px, px_meta = get_live_sol_price()
     px = float(px) if px and float(px) > 0 else float(SOL_PRICE_USD_STATIC_FALLBACK)
-
     qty = usd / px if px > 0 else 0.0
 
-    pos = STATE.setdefault("positions", {}).setdefault("SOL", {
-        "symbol": "SOL",
-        "qty": 0.0,
-        "cost_usd": 0.0,
-        "avg_px": 0.0,
-        "opened_ts": None,
-        "last_buy_ts": None,
-        "mark_px": px,
-        "closed_ts": None,
-        "last_sell_ts": None,
-
-        # Exit stack fields
-        "hwm_px": 0.0,
-        "trail_stop_px": 0.0,
-        "tp1_done": False,
-        "tp2_done": False,
-        "tp3_done": False,
-        "moon_mode": False,
-    })
-
+    pos = _get_or_create_sol_position(px)
     prev_qty = float(pos.get("qty", 0.0) or 0.0)
 
     if prev_qty <= 0.0:
@@ -855,8 +849,6 @@ def paper_buy_sol(usd: float, meta: Dict[str, Any]) -> bool:
         pos["opened_ts"] = None
         pos["closed_ts"] = None
         pos["last_sell_ts"] = None
-
-        # reset exit stack on fresh entry
         pos["hwm_px"] = 0.0
         pos["trail_stop_px"] = 0.0
         pos["tp1_done"] = False
@@ -876,14 +868,11 @@ def paper_buy_sol(usd: float, meta: Dict[str, Any]) -> bool:
     pos["avg_px"] = new_avg
     pos["mark_px"] = px
 
-    # Initialize HWM if empty
-    if float(pos.get("hwm_px", 0.0) or 0.0) <= 0:
-        pos["hwm_px"] = float(px)
-
     now = _now_ts()
     if not pos.get("opened_ts"):
         pos["opened_ts"] = now
     pos["last_buy_ts"] = now
+    pos["hwm_px"] = max(float(pos.get("hwm_px", 0.0) or 0.0), px)
 
     STATE["cash_usd"] = cash - usd
     STATE["trades_count"] += 1
@@ -900,7 +889,7 @@ def paper_buy_sol(usd: float, meta: Dict[str, Any]) -> bool:
         qty=qty,
         cash_usd_after=round(float(STATE["cash_usd"]), 6),
         reason="matched_helius_event",
-        meta=meta2
+        meta=meta2,
     )
 
     push_recent_trade({
@@ -917,19 +906,23 @@ def paper_buy_sol(usd: float, meta: Dict[str, Any]) -> bool:
     rebalance_targets()
     return True
 
+
 # ----------------------------
 # FastAPI app
 # ----------------------------
 
 app = FastAPI()
 
+
 @app.get("/")
 def root():
     return {"ok": True, "service": "sol-paper-bot", "ts": _now_ts()}
 
+
 @app.get("/health")
 def health():
     return {"ok": True}
+
 
 @app.get("/paper/state")
 def paper_state():
@@ -954,7 +947,6 @@ def paper_state():
         "RESERVE_PCT": RESERVE_PCT,
         "TRADABLE_PCT": TRADABLE_PCT,
 
-        # Exit stack config
         "HARD_SL_PCT": HARD_SL_PCT,
         "TP1_PCT": TP1_PCT,
         "TP1_SELL_PCT": TP1_SELL_PCT,
@@ -969,6 +961,10 @@ def paper_state():
         "TIME_STOP_SECONDS": TIME_STOP_SECONDS,
         "TIME_STOP_MIN_PROFIT_PCT": TIME_STOP_MIN_PROFIT_PCT,
         "MOON_TRIGGER_PCT": MOON_TRIGGER_PCT,
+        "BUY_COOLDOWN_SECONDS": BUY_COOLDOWN_SECONDS,
+
+        "HOLD_MAX_SECONDS": HOLD_MAX_SECONDS,
+        "FORCED_EXIT_FALLBACK_MULTI": FORCED_EXIT_FALLBACK_MULTI,
 
         "TRACKED_WALLETS_COUNT": len(TRACKED_WALLETS),
         "DEBUG_WEBHOOK": DEBUG_WEBHOOK,
@@ -981,14 +977,17 @@ def paper_state():
     out["config"] = cfg
     return JSONResponse(out)
 
+
 @app.get("/paper/events")
 def paper_events(count: int = 200):
     count = max(1, min(int(count), 2000))
     return {"count": count, "events": EVENTS[-count:]}
 
+
 @app.get("/events")
 def events_alias(count: int = 200):
     return paper_events(count=count)
+
 
 def _is_authorized(req: Request) -> bool:
     if not WEBHOOK_SECRET:
@@ -1007,6 +1006,7 @@ def _is_authorized(req: Request) -> bool:
         return token == WEBHOOK_SECRET
     return False
 
+
 def _token_matches(path_token: str) -> bool:
     if not WEBHOOK_PATH_TOKEN:
         return True
@@ -1014,9 +1014,12 @@ def _token_matches(path_token: str) -> bool:
     b = (path_token or "").strip()
     if a == b:
         return True
+
     def norm(x: str) -> str:
         return x[5:] if x.startswith("hook_") else x
+
     return norm(a) == norm(b)
+
 
 @app.post("/webhook/{token}")
 async def webhook(token: str, request: Request):
@@ -1061,7 +1064,7 @@ async def webhook(token: str, request: Request):
 
     matched = 0
 
-    # Run exit stack before processing this batch
+    # Run exit stack before processing fresh buys
     maybe_run_exit_stack()
 
     for item in items:
@@ -1089,16 +1092,32 @@ async def webhook(token: str, request: Request):
             log_event("debug_webhook_item", note="matched_swap", wallet=wallet, side=side, debug=dbg)
 
         if side == "sell":
-            # NEW: do NOT copy-sell anymore — exit stack handles exits
+            # Exit stack handles sells now; whale sells are ignored
             log_event("wallet_sell_ignored_exit_stack_active", wallet=wallet, signature=meta.get("signature"))
+
         elif side == "buy":
+            # Small anti-spam buy upgrade
+            last_buy_ts = int((STATE.get("wallet_last_buy_ts", {}) or {}).get(wallet, 0) or 0)
+            now_ts = _now_ts()
+            if now_ts - last_buy_ts < BUY_COOLDOWN_SECONDS:
+                STATE["counters"]["skipped_buy_cooldown"] += 1
+                log_event(
+                    "buy_skipped_cooldown",
+                    wallet=wallet,
+                    signature=meta.get("signature"),
+                    cooldown_s=BUY_COOLDOWN_SECONDS,
+                    last_buy_ts=last_buy_ts,
+                )
+                continue
+
+            STATE.setdefault("wallet_last_buy_ts", {})[wallet] = now_ts
             paper_buy_sol(MAX_BUY_USD, meta=meta2)
-            # Optional: check exit stack immediately after buy
             maybe_run_exit_stack()
+
         else:
-            log_event("swap_side_unknown_default_buy", wallet=wallet, signature=meta.get("signature"), debug=dbg)
-            paper_buy_sol(MAX_BUY_USD, meta=meta2)
-            maybe_run_exit_stack()
+            # UNKNOWN side -> SKIP (prevents accidental spam buys)
+            log_event("swap_side_unknown_skipped", wallet=wallet, signature=meta.get("signature"), debug=dbg)
+            continue
 
     log_event("webhook_ok", payload_type=payload_type, tracked_wallets_count=len(TRACKED_WALLETS), matched=matched)
 
